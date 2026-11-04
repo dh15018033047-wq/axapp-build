@@ -1,0 +1,5039 @@
+//
+//  AXAgent.mm
+//  1:1 复刻 AScript 的 ASAgen 启动链与触控链（依据其二进制反汇编）
+//
+//  反汇编依据（ASAgent 类，二进制地址）：
+//    -[loadXCTestStack]          @0x100149904
+//    -[bootstrap]                @0x100149ba4
+//    -[enableInProcessAccessibility] @0x10014a104
+//    -[finishBootstrap]          @0x10014ab28
+//    -[tuneTestmanagerdStateTimeout] @0x10014b898
+//    -[ddiAutomationFrameworkPath]   @0x10014b96c
+//    -[installUITestConfiguration]   @0x10014bb00
+//    -[touchPathAtPoint:offset:] @0x10014c4dc
+//    -[recordWithPath:]          @0x10014c59c
+//    -[synthesizeRecord:error:]  @0x10014c6ac
+//
+//  调用序列（原样）：
+//    1. dlopen 框架（DDI 优先，8 条路径，RTLD_NOW|RTLD_GLOBAL）
+//    2. NSClassFromString(@"XCTRunnerDaemonSession") == nil 才继续
+//    3. _AXSSetAutomationEnabled(YES) + AXCodeLoader + XCAXClient_iOS
+//    4. [XCTRunnerDaemonSession sharedSession]
+//    5. -requestAutomationSessionForTestTargetWithPID:(getpid()) preferredBackendPath:nil reply:^{}
+//    6. -enableAutomationModeWithError:
+//    7. -finishInitializationForUIAutomation
+//    8. -requestBackgroundAssertionForPID:reply:
+//    9. -implicitEventConfirmationIntervalForCurrentContext
+//   10. _XCTSetApplicationStateTimeout(0.1)
+//   11. XCTestConfiguration initializeForUITesting + sessionIdentifier/productModuleName
+//   12. -setImplicitEventConfirmationIntervalForCurrentContext:0
+//   13. FBConfiguration setWaitForIdleTimeout:0
+//
+//  触控：
+//    XCPointerEventPath initForTouchAtPoint:offset:
+//    XCSynthesizedEventRecord initWithName:interfaceOrientation: + addPointerEventPath:
+//    [daemonSession synthesizeEvent:completion:]
+//
+
+#import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
+#import <objc/message.h>
+#import <objc/runtime.h>
+#import <dispatch/dispatch.h>   /* QOS_CLASS_UTILITY（SpringBoard 预热用） */
+#include <mach/mach_time.h>     /* mach_absolute_time（HID 事件时间戳） */
+#import <dlfcn.h>
+#import <unistd.h>
+#import <stdarg.h>
+#import <ctype.h>
+#import <Security/Security.h>
+#import <CommonCrypto/CommonCryptor.h>
+#import <ReplayKit/ReplayKit.h>
+#import <AVFoundation/AVFoundation.h>
+#import <CoreImage/CoreImage.h>
+#import "AXStream.h"
+#import <sys/time.h>
+#import <signal.h>
+#import <string.h>
+#import <stdlib.h>
+#import <stdio.h>
+#import <time.h>
+#import <errno.h>
+#import <fcntl.h>
+#import <arpa/inet.h>
+#import <netinet/tcp.h>
+#import <netinet/in.h>
+#import <sys/socket.h>
+#import <pthread.h>
+#import <ImageIO/ImageIO.h>
+#import <CoreVideo/CoreVideo.h>
+#import <VideoToolbox/VideoToolbox.h>
+#import <mach/mach.h>
+#import <mach/mach_time.h>
+
+static id  gSession = nil;
+static BOOL gReady = NO;
+static NSString *gLastError = nil;
+
+#pragma mark - 日志（写 Documents/agent.log，PC 可拉取）
+
+static NSString *AXLogPath(void) {
+    static NSString *p = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSArray *d = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+        p = [d.firstObject stringByAppendingPathComponent:@"agent.log"];
+    });
+    return p;
+}
+
+/* ★ 2026-10-31 修「运行日志满屏乱码」的根因：
+   以前 ALog 不加锁，控制队列 / 编码循环 / VT 回调多个线程同时
+   「seek 到末尾 + writeData」，写到一半被别的线程插进来 → 字节交错，
+   一个汉字的 3 个字节被拆到两处 → 文件里出现非法 UTF-8 序列。
+   只要有一处坏字节，日志页整块 UTF-8 解码就失败（以前还会退化成 Latin1，整页花）。
+   现在：全局锁串行化 + 复用 NSDateFormatter（顺带省掉每行一次 formatter 创建）。 */
+static NSLock *gLogLock = nil;
+static NSDateFormatter *gLogDF = nil;
+
+static void ALog(NSString *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSLog(@"%@", s);
+
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        gLogLock = [NSLock new];
+        gLogDF = [NSDateFormatter new];
+        gLogDF.dateFormat = @"HH:mm:ss.SSS";
+    });
+
+    [gLogLock lock];
+    @try {
+        NSString *line = [NSString stringWithFormat:@"%@ %@\n",
+                          [gLogDF stringFromDate:[NSDate date]], s];
+        NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
+        NSString *path = AXLogPath();
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (![fm fileExistsAtPath:path]) {
+            [d writeToFile:path atomically:YES];
+        } else {
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+            if (fh) {
+                [fh seekToEndOfFile];
+                [fh writeData:d];
+                [fh closeFile];
+            }
+        }
+    } @catch (NSException *e) {
+        /* 日志失败绝不能影响主流程 */
+    }
+    [gLogLock unlock];
+}
+
+/* AXStream.mm 用的日志入口（ALog 是 static，跨文件用不了） */
+extern "C" void ALogShim(NSString *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    ALog(@"%@", s);
+}
+
+#pragma mark - 动态调用小工具
+
+/* ★★ 关掉 XCTest 的「等 App 空闲（quiescence）」—— 2026-11-02
+   现象：点击修好后，HOME（XCUIDevice.pressButton:）每次还要 **5.5 秒**，滑动也卡。
+      日志证据：`🏠 pressHome 已发送` 相邻间隔 02:43:48.993 → 54.534 → 00.070 → 05.599，
+      正好每次 5.5s —— 这是 XCTest 的 quiescence 超时（默认 5s）在等「App 闲下来」。
+      目标 App 只要一直在动（视频/动画/游戏），就永远等满 5 秒。
+   做法：把 XCUIAutomation 里这几个判定「跳过/立即空闲」的方法直接换实现：
+      -[XCUIApplicationProcess waitForQuiescenceIncludingAnimationsIdle:isPreEvent:]  → 立即返回 YES
+      -[XCUIApplicationProcess waitForQuiescenceIncludingAnimationsIdle:]            → 立即返回 YES
+      -[XCUIApplicationProcess shouldSkipPreEventQuiescence] / ShouldSkipPost...     → 返回 YES
+   这些方法名是从包内 XCUIAutomation 的符号表里捞出来的，找不到就跳过并打日志。 */
+static BOOL AXQuiYes2(id self, SEL _cmd, BOOL a, BOOL b) { return YES; }
+static BOOL AXQuiYes3(id self, SEL _cmd, BOOL a, id b, BOOL c) { return YES; }
+static BOOL AXQuiYes1(id self, SEL _cmd, BOOL a) { return YES; }
+static BOOL AXQuiYes0(id self, SEL _cmd) { return YES; }
+static void AXQuiVoid1(id self, SEL _cmd, BOOL a) { /* 什么都不做 = 立即返回 */ }
+static void AXQuiVoid0(id self, SEL _cmd) { }
+
+/* ★★ 2026-11-02 全量版：把 XCTest 所有「等 App 空闲（quiescence）」的入口都关掉。
+   为什么需要全量：SpringBoard（桌面）一直在动（小组件/动画），永远不"闲"，
+   XCTest 每笔事件都要等它闲下来，等不到就卡满默认 5 秒 —— 用户实测「就在桌面上点图标也要等几秒」。
+   其他 App 页面通常静止，所以那边看着很快，把问题掩盖了。
+   ★ 方法名全部来自包内 XCUIAutomation 的符号表；每个都独立 try，缺哪个就只跳过哪个并打日志。 */
+static void AXInstallQuiescenceKiller(void) {
+    struct { const char *clsName; const char *selName; IMP imp; } tbl[] = {
+        /* 进程级：真正的等待入口（新版把 isPreEvent 挪到了别的变体上） */
+        {"XCUIApplicationProcess", "waitForQuiescenceIncludingAnimationsIdle:isPreEvent:",                 (IMP)AXQuiYes2},
+        {"XCUIApplicationProcess", "waitForQuiescenceIncludingAnimationsIdle:usingActivity:isPreEvent:",   (IMP)AXQuiYes3},
+        {"XCUIApplicationProcess", "waitForQuiescenceIncludingAnimationsIdle:",                           (IMP)AXQuiYes1},
+        {"XCUIApplicationProcess", "shouldSkipPreEventQuiescence",                                        (IMP)AXQuiYes0},
+        {"XCUIApplicationProcess", "shouldSkipPostEventQuiescence",                                       (IMP)AXQuiYes0},
+        {"XCUIApplicationProcess", "_initiateQuiescenceChecksIncludingAnimationsIdle:",                    (IMP)AXQuiVoid1},
+        /* 应用级 */
+        {"XCUIApplication", "_waitForQuiescence",                                                          (IMP)AXQuiVoid0},
+        {"XCUIApplication", "_waitForQuiescenceAsPreEvent:",                                               (IMP)AXQuiVoid1},
+        /* AX 客户端级（所有前台 App 的整批等待） */
+        {"XCAXClient_iOS",  "waitForQuiescenceOnAllForegroundApplicationsAsPreEvent:",                    (IMP)AXQuiVoid1},
+    };
+    int hit = 0, miss = 0;
+    for (int i = 0; i < (int)(sizeof(tbl) / sizeof(tbl[0])); i++) {
+        Class cls = NSClassFromString([NSString stringWithUTF8String:tbl[i].clsName]);
+        if (!cls) { ALog(@"  ⚠️ 无类 %s", tbl[i].clsName); miss++; continue; }
+        SEL s = NSSelectorFromString([NSString stringWithUTF8String:tbl[i].selName]);
+        Method m = class_getInstanceMethod(cls, s);
+        if (!m) { ALog(@"  ⚠️ 无 -[%s %s]", tbl[i].clsName, tbl[i].selName); miss++; continue; }
+        method_setImplementation(m, tbl[i].imp);
+        ALog(@"  ✅ 关闭 -[%s %s]", tbl[i].clsName, tbl[i].selName);
+        hit++;
+    }
+    ALog(@"  🧯 quiescence 补丁：命中 %d 个、缺失 %d 个", hit, miss);
+}
+
+/* 定义在文件后部（录屏探针那节），这里先声明 */
+static void AXDumpClass(NSString *name);
+
+/* ★ 2026-11-02：查一个 selector **到底在哪个类上**。
+   起因：AScript 里出现了 `_XCT_synthesizeEvent:implicitConfirmationInterval:completion:`，
+   而我们打在 `[XCTRunnerDaemonSession sharedSession]` 上直接 unrecognized selector。
+   说明这个方法不在那个类 —— 遍历所有已加载的类，把实现它的类名打出来，
+   下一版就能打到正确的对象上。 */
+static void AXFindSelectorOwners(const char *selName) {
+    SEL s = NSSelectorFromString([NSString stringWithUTF8String:selName]);
+    if (!s) { ALog(@"  🔍 %s: selector 无效", selName); return; }
+    int cnt = objc_getClassList(NULL, 0);
+    if (cnt <= 0) { ALog(@"  🔍 %s: 拿不到类列表", selName); return; }
+    Class *buf = (Class *)malloc(sizeof(Class) * (size_t)cnt);
+    if (!buf) return;
+    cnt = objc_getClassList(buf, cnt);
+    int found = 0;
+    for (int i = 0; i < cnt; i++) {
+        Class c = buf[i];
+        if (!c) continue;
+        if (class_getInstanceMethod(c, s)) {
+            ALog(@"  🔍 %s → 实例方法 @ %s", selName, class_getName(c));
+            found++;
+        }
+        if (class_getClassMethod(c, s)) {
+            ALog(@"  🔍 %s → 类方法 @ %s", selName, class_getName(c));
+            found++;
+        }
+        if (found >= 8) break;
+    }
+    if (!found) ALog(@"  🔍 %s → 没有任何类实现", selName);
+    free(buf);
+}
+
+static void AXCallVoid(id obj, NSString *selName) {
+    SEL sel = NSSelectorFromString(selName);
+    if (!obj || ![obj respondsToSelector:sel]) return;
+    @try {
+        void (*fp)(id, SEL) = (void (*)(id, SEL))objc_msgSend;
+        fp(obj, sel);
+    } @catch (NSException *e) { ALog(@"  ❌ %@ 异常: %@", selName, e.reason); }
+}
+
+static id AXShared(id cls, NSArray<NSString *> *names) {
+    if (!cls) return nil;
+    for (NSString *n in names) {
+        SEL sel = NSSelectorFromString(n);
+        if ([cls respondsToSelector:sel]) {
+            @try {
+                id (*fp)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+                id r = fp(cls, sel);
+                if (r) { ALog(@"  ✅ %@ 取到实例: %@", n, NSStringFromClass([r class])); return r; }
+            } @catch (NSException *e) { ALog(@"  ❌ %@ 异常: %@", n, e.reason); }
+        }
+    }
+    return nil;
+}
+
+#pragma mark - 1. loadXCTestStack（DDI 优先）
+
+static const char *kXCTestPaths[] = {
+    "/Developer/Library/Frameworks/XCTest.framework/XCTest",
+    "/System/Developer/Library/Frameworks/XCTest.framework/XCTest",
+    "/Developer/Library/PrivateFrameworks/XCTestCore.framework/XCTestCore",
+    "/System/Developer/Library/PrivateFrameworks/XCTestCore.framework/XCTestCore",
+    "/Developer/Library/PrivateFrameworks/XCTAutomationSupport.framework/XCTAutomationSupport",
+    "/System/Developer/Library/PrivateFrameworks/XCTAutomationSupport.framework/XCTAutomationSupport",
+    "/Developer/Library/PrivateFrameworks/XCUIAutomation.framework/XCUIAutomation",
+    "/System/Developer/Library/PrivateFrameworks/XCUIAutomation.framework/XCUIAutomation",
+};
+
+static BOOL AXLoadXCTestStack(void) {
+    ALog(@"--- 1) loadXCTestStack（DDI 优先，同 AScript）");
+
+    if (NSClassFromString(@"XCTRunnerDaemonSession")) {
+        ALog(@"  ✅ XCTRunnerDaemonSession 已存在，跳过加载");
+        return YES;
+    }
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    int ok = 0, tried = 0;
+    for (int i = 0; i < (int)(sizeof(kXCTestPaths) / sizeof(kXCTestPaths[0])); i++) {
+        const char *p = kXCTestPaths[i];
+        NSString *sp = [NSString stringWithUTF8String:p];
+        BOOL exists = [fm fileExistsAtPath:sp];
+        if (!exists) continue;
+        tried++;
+        dlerror();
+        void *h = dlopen(p, RTLD_NOW | RTLD_GLOBAL);   // 0xa，与 AScript 一致
+        const char *err = dlerror();
+        if (h) {
+            ok++;
+            ALog(@"  ✅ dlopen %@", sp);
+        } else {
+            ALog(@"  ❌ dlopen %@  err=%s", sp, err ? err : "?");
+        }
+    }
+    ALog(@"  DDI 路径：存在 %d 条，成功 %d 条", tried, ok);
+
+    if (!NSClassFromString(@"XCTRunnerDaemonSession")) {
+        ALog(@"  ℹ️ 免越狱环境未挂载 DDI，跳过包内高版本 XCTest 框架，启用原生 IOKit HID + ReplayKit 引擎");
+    }
+
+    BOOL has = NSClassFromString(@"XCTRunnerDaemonSession") != nil;
+    ALog(@"  XCTRunnerDaemonSession 可用: %@", has ? @"YES" : @"NO");
+    return has;
+}
+
+#pragma mark - 2. enableInProcessAccessibility
+
+static void AXEnableInProcessAccessibility(void) {
+    ALog(@"--- 2) enableInProcessAccessibility");
+    dlopen("/usr/lib/libAccessibility.dylib", RTLD_LAZY);
+
+    void (*setAuto)(BOOL) = (void (*)(BOOL))dlsym(RTLD_DEFAULT, "_AXSSetAutomationEnabled");
+    if (setAuto) {
+        @try { setAuto(YES); ALog(@"  ✅ _AXSSetAutomationEnabled(YES)"); }
+        @catch (NSException *e) { ALog(@"  ❌ _AXSSetAutomationEnabled: %@", e.reason); }
+    } else {
+        ALog(@"  ❌ dlsym _AXSSetAutomationEnabled 为空");
+    }
+
+    Class loaderCls = NSClassFromString(@"AXCodeLoader");
+    ALog(@"  AXCodeLoader: %@", loaderCls ? @"有" : @"无");
+    if (loaderCls) {
+        id loader = AXShared(loaderCls, @[@"sharedInstance", @"sharedAXCodeLoader", @"sharedLoader", @"shared"]);
+        if (loader) {
+            if ([loader respondsToSelector:NSSelectorFromString(@"setShouldAutoloadAccessibilityCodeItems:")]) {
+                @try {
+                    void (*fp)(id, SEL, BOOL) = (void (*)(id, SEL, BOOL))objc_msgSend;
+                    fp(loader, NSSelectorFromString(@"setShouldAutoloadAccessibilityCodeItems:"), YES);
+                    ALog(@"  ✅ setShouldAutoloadAccessibilityCodeItems:YES");
+                } @catch (NSException *e) { ALog(@"  ❌ setShouldAutoload: %@", e.reason); }
+            }
+            AXCallVoid(loader, @"_loadAccessibilityCodeItems");
+        }
+    }
+
+    Class axCls = NSClassFromString(@"XCAXClient_iOS");
+    ALog(@"  XCAXClient_iOS: %@", axCls ? @"有" : @"无");
+    if (axCls) {
+        id client = AXShared(axCls, @[@"sharedClient"]);
+        if (client) ALog(@"  ✅ XCAXClient_iOS.sharedClient 就绪");
+    }
+}
+
+#pragma mark - 3. bootstrap
+
+static long AXOrientationMainThread(void) {
+    long o = UIInterfaceOrientationPortrait;
+    UIWindow *w = nil;
+    for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+        if (![s isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *win in ((UIWindowScene *)s).windows) {
+            if (win.isKeyWindow) { w = win; break; }
+        }
+        if (w) break;
+    }
+    if (w && w.windowScene) o = (long)w.windowScene.interfaceOrientation;
+    return o;
+}
+
+static long AXInterfaceOrientation(void) {
+    if ([NSThread isMainThread]) {
+        long o = AXOrientationMainThread();
+        ALog(@"  界面方向: %ld", o);
+        return o;
+    }
+    __block long o = UIInterfaceOrientationPortrait;
+    dispatch_sync(dispatch_get_main_queue(), ^{ o = AXOrientationMainThread(); });
+    ALog(@"  界面方向: %ld", o);
+    return o;
+}
+
+static int AXHIDTouchInit(void);
+extern "C" void AXAgentSetHIDTap(int on);
+
+static BOOL AXAgentBootstrap(void) {
+    @try {
+        @autoreleasepool {
+            ALog(@"===== 远控2 核心引擎启动 =====");
+
+            if (!AXLoadXCTestStack()) {
+                AXEnableInProcessAccessibility();
+                AXHIDTouchInit();
+                AXAgentSetHIDTap(1);
+                gReady = YES;
+                gLastError = nil;
+                ALog(@"✅ 远控2 免越狱全功能模式已就绪（IOKit HID 触控 + ReplayKit 投屏）");
+                return YES;
+            }
+
+            AXEnableInProcessAccessibility();
+
+            ALog(@"--- 3) XCTRunnerDaemonSession.sharedSession");
+            Class cls = NSClassFromString(@"XCTRunnerDaemonSession");
+            if (!cls) {
+                gLastError = @"XCTRunnerDaemonSession 类不存在";
+                ALog(@"❌ 终止：%@", gLastError);
+                return NO;
+            }
+            SEL ss = NSSelectorFromString(@"sharedSession");
+            if (![cls respondsToSelector:ss]) {
+                gLastError = @"无 sharedSession";
+                ALog(@"❌ 终止：%@", gLastError);
+                return NO;
+            }
+
+            id session = nil;
+            @try {
+                id (*fp)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+                session = fp(cls, ss);
+            } @catch (NSException *e) {
+                gLastError = [NSString stringWithFormat:@"sharedSession 抛异常 %@: %@", e.name, e.reason];
+                ALog(@"❌ %@", gLastError);
+                return NO;
+            }
+            if (!session) {
+                gLastError = @"sharedSession 返回 nil";
+                ALog(@"❌ 终止：%@", gLastError);
+                return NO;
+            }
+            gSession = session;
+            ALog(@"  ✅ sharedSession = %p", (__bridge void *)session);
+
+            pid_t pid = getpid();
+            ALog(@"  目标 PID = %d（自己）", pid);
+
+            // 5) requestAutomationSessionForTestTargetWithPID:preferredBackendPath:reply:
+            SEL rs = NSSelectorFromString(@"requestAutomationSessionForTestTargetWithPID:preferredBackendPath:reply:");
+            if (session && [session respondsToSelector:rs]) {
+                @try {
+                    void (^reply)(id) = ^(id a) {
+                        // 参数可能是 BOOL/NSError*/裸指针，绝不能用 %@ 格式化（会访问野指针崩）
+                        ALog(@"  📥 requestAutomationSession reply 收到（%@）", a ? @"非空" : @"空");
+                    };
+                    void (*fp)(id, SEL, int, id, id) = (void (*)(id, SEL, int, id, id))objc_msgSend;
+                    fp(session, rs, (int)pid, nil, reply);
+                    ALog(@"  ✅ requestAutomationSession 已发出");
+                } @catch (NSException *e) {
+                    ALog(@"  ❌ requestAutomationSession 异常: %@ / %@", e.name, e.reason);
+                }
+            } else {
+                ALog(@"  ⚠️ 无 requestAutomationSession 方法");
+            }
+
+            // 6) enableAutomationModeWithError:
+            SEL es = NSSelectorFromString(@"enableAutomationModeWithError:");
+            if ([session respondsToSelector:es]) {
+                @try {
+                    NSError *err = nil;
+                    BOOL (*fp)(id, SEL, NSError **) = (BOOL (*)(id, SEL, NSError **))objc_msgSend;
+                    BOOL ok = fp(session, es, &err);
+                    ALog(@"  enableAutomationMode = %@ err=%@", ok ? @"YES" : @"NO", err.localizedDescription ?: @"(nil)");
+                } @catch (NSException *e) {
+                    ALog(@"  ❌ enableAutomationMode 异常: %@ / %@", e.name, e.reason);
+                }
+            }
+
+            // 7) finishInitializationForUIAutomation
+            AXCallVoid(session, @"finishInitializationForUIAutomation");
+            ALog(@"  finishInitializationForUIAutomation 已调用");
+
+            // 8) requestBackgroundAssertionForPID:reply:
+            SEL bs = NSSelectorFromString(@"requestBackgroundAssertionForPID:reply:");
+            if ([session respondsToSelector:bs]) {
+                @try {
+                    void (^reply)(id) = ^(id a) { ALog(@"  📥 backgroundAssertion reply 收到（%@）", a ? @"非空" : @"空"); };
+                    void (*fp)(id, SEL, int, id) = (void (*)(id, SEL, int, id))objc_msgSend;
+                    fp(session, bs, (int)pid, reply);
+                    ALog(@"  ✅ requestBackgroundAssertion 已发出");
+                } @catch (NSException *e) { ALog(@"  ❌ backgroundAssertion: %@", e.reason); }
+            }
+
+            // 9) implicitEventConfirmationIntervalForCurrentContext
+            SEL is = NSSelectorFromString(@"implicitEventConfirmationIntervalForCurrentContext");
+            if ([session respondsToSelector:is]) {
+                @try {
+                    double (*fp)(id, SEL) = (double (*)(id, SEL))objc_msgSend;
+                    double d = fp(session, is);
+                    ALog(@"  implicitEventConfirmationInterval = %.3f", d);
+                } @catch (NSException *e) { ALog(@"  ❌ implicitInterval: %@", e.reason); }
+            }
+
+            // 9b) 探针（2026-11-02）：把「能改事件确认超时」的入口全试一遍，只打印存在与否，
+            //     **不改任何值**（b78 把全局设成 0 → 一点击就闪退，教训在此）。
+            {
+                const char *syms[] = {
+                    "_XCTSetEventConfirmationTimeout",
+                    "_XCTSetImplicitEventConfirmationInterval",
+                    "_XCTEventConfirmationTimeout",
+                    NULL
+                };
+                for (int i = 0; syms[i]; i++) {
+                    void *p = dlsym(RTLD_DEFAULT, syms[i]);
+                    ALog(@"  🔎 dlsym %s -> %s", syms[i], p ? "有" : "无");
+                }
+                const char *sels[] = {
+                    "_XCT_synthesizeEvent:implicitConfirmationInterval:completion:",
+                    "XCT_synthesizeEvent:implicitConfirmationInterval:completion:",
+                    "setImplicitEventConfirmationIntervalForCurrentContextWithoutSideEffects:",
+                    NULL
+                };
+                for (int i = 0; sels[i]; i++) {
+                    SEL s2 = NSSelectorFromString([NSString stringWithUTF8String:sels[i]]);
+                    ALog(@"  🔎 sel %s -> %s", sels[i], [session respondsToSelector:s2] ? "有" : "无");
+                }
+            }
+
+            // 9c) 把**全局确认间隔**压到 0.05 秒。实测（10010 同步返回的「上次确认」字段）：
+            //       5.0 → 9473ms ｜ 1.0 → 1973ms ｜ 0.3 → 809ms ｜ 0.1 → 385ms ｜ **0.05 → 128ms**
+            //     确认从来不会成功（err 一直涨），所以这就是"干等超时"的时长 —— 越小越跟手。
+            //     ★ 设 0 会让进程闪退（b78 实测），代码里口径最小 0.05，永远不给 0。
+            //     运行时可用 {"cmd":"cfmto","v":秒} 改，不用重新出包。
+            {
+                SEL s3 = NSSelectorFromString(@"setImplicitEventConfirmationIntervalForCurrentContextWithoutSideEffects:");
+                @try {
+                    ((void (*)(id, SEL, double))objc_msgSend)(session, s3, 0.05);
+                    double now = -1;
+                    SEL rd = NSSelectorFromString(@"implicitEventConfirmationIntervalForCurrentContext");
+                    if ([session respondsToSelector:rd]) {
+                        now = ((double (*)(id, SEL))objc_msgSend)(session, rd);
+                    }
+                    ALog(@"⚙️ 全局确认间隔 → 0.05，回读 = %.3f", now);
+                } @catch (NSException *e) {
+                    ALog(@"⚠️ 全局确认间隔设置失败：%@", e.reason);
+                }
+            }
+
+            // 9d) AScript 里也用了 setWaitForIdleTimeout:（静默等待应用 idle 的超时）。
+            //     设 0 = 不等 idle，避免每次点击前先等 App「闲下来」。
+            {
+                SEL wi = NSSelectorFromString(@"setWaitForIdleTimeout:");
+                @try {
+                    ((void (*)(id, SEL, double))objc_msgSend)(session, wi, 0.0);
+                    ALog(@"  ✅ setWaitForIdleTimeout(0) 已设");
+                } @catch (NSException *e) {
+                    ALog(@"  ⚠️ setWaitForIdleTimeout 不可用：%@", e.reason);
+                }
+            }
+
+            // 9e) 关掉「等 App 空闲」—— HOME / 滑动的 5 秒就耗在这上面（详见 AXInstallQuiescenceKiller 注释）
+            AXInstallQuiescenceKiller();
+
+            // 9f) 这几个私有入口到底挂在哪个类上（我们打在 daemonSession 上是 unrecognized selector，
+            //     说明类打错了；AScript 能用，它必然是打在对的对象上）
+            AXFindSelectorOwners("_XCT_synthesizeEvent:implicitConfirmationInterval:completion:");
+            AXFindSelectorOwners("_XCT_synthesizeEvent:completion:");
+            AXFindSelectorOwners("_silentPressButton:");
+            /* 也有可能它根本不是 ObjC 方法，而是一个 C 函数（XCTestCore 里带这串名字） */
+            {
+                void *fpC = dlsym(RTLD_DEFAULT, "_XCT_synthesizeEvent");
+                ALog(@"  🔍 dlsym _XCT_synthesizeEvent -> %p", fpC);
+            }
+
+            gReady = YES;
+            gLastError = nil;
+            ALog(@"✅ 会话就绪（gReady=YES）");
+
+            // 10) _XCTSetApplicationStateTimeout(0.1)
+            void (*setTimeout)(double) = (void (*)(double))dlsym(RTLD_DEFAULT, "_XCTSetApplicationStateTimeout");
+            if (setTimeout) {
+                @try { setTimeout(0.1); ALog(@"  ✅ _XCTSetApplicationStateTimeout(0.1)"); }
+                @catch (NSException *e) { ALog(@"  ❌ setTimeout: %@", e.reason); }
+            }
+
+            // 11) XCTestConfiguration
+            Class cfgCls = NSClassFromString(@"XCTestConfiguration");
+            if (cfgCls) {
+                SEL atc = NSSelectorFromString(@"activeTestConfiguration");
+                id cfg = nil;
+                if ([cfgCls respondsToSelector:atc]) {
+                    @try {
+                        id (*fp)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+                        cfg = fp(cfgCls, atc);
+                    } @catch (NSException *e) { }
+                }
+                if (!cfg) {
+                    @try {
+                        cfg = [[cfgCls alloc] init];
+                        if ([cfg respondsToSelector:NSSelectorFromString(@"initializeForUITesting")]) {
+                            void (*fp)(id, SEL) = (void (*)(id, SEL))objc_msgSend;
+                            fp(cfg, NSSelectorFromString(@"initializeForUITesting"));
+                        }
+                        [cfg setValue:[NSUUID UUID] forKey:@"sessionIdentifier"];
+                        [cfg setValue:@"AXAgent" forKey:@"productModuleName"];
+                        ALog(@"  ✅ 新建 XCTestConfiguration（sessionIdentifier/productModuleName=AXAgent）");
+                        /* ★★★ 2026-11-02 b98：建完必须**设为 active**，否则
+                           `+[XCTestConfiguration activeTestConfiguration]` 一直是 nil，
+                           系统就判定"这台设备没配置成 UI 测试"⇒ XCUIApplication 直接用不了：
+                           `Device is not configured for UI testing - use of XCUIApplication is not
+                            supported. This can happen when XCUIApplication is used in a unit test
+                            bundle instead of a UI test bundle.`（b97 日志实证）
+                           这一条也是"确认永远失败、HOME 后必等 5 秒"的根子 —— daemon 拿不到
+                           有效配置，就只能按默认超时干等。 */
+                        SEL satc = NSSelectorFromString(@"setActiveTestConfiguration:");
+                        if ([cfgCls respondsToSelector:satc]) {
+                            ((void (*)(id, SEL, id))objc_msgSend)(cfgCls, satc, cfg);
+                            id back = ((id (*)(id, SEL))objc_msgSend)(cfgCls, atc);
+                            ALog(@"  ✅ setActiveTestConfiguration 已设置，回读 %@", back ? @"非空" : @"仍是 nil");
+                        } else {
+                            ALog(@"  ⚠️ XCTestConfiguration 无 setActiveTestConfiguration:");
+                        }
+                    } @catch (NSException *e) { ALog(@"  ❌ XCTestConfiguration: %@", e.reason); }
+                } else {
+                    ALog(@"  XCTestConfiguration 已存在: %@", cfg);
+                }
+            }
+
+            /* b98：打印「设备是否被配置成 UI 测试」—— 这是 XCUIApplication 能不能用的总开关，
+               也是 b97 那条 `Device is not configured for UI testing` 的直接判据。 */
+            {
+                Class devCls = NSClassFromString(@"XCUIDevice");
+                SEL sd = NSSelectorFromString(@"sharedDevice");
+                id dev = (devCls && [devCls respondsToSelector:sd])
+                    ? ((id (*)(id, SEL))objc_msgSend)(devCls, sd) : nil;
+                SEL cu = NSSelectorFromString(@"configuredForUITesting");
+                BOOL cuOK = (dev && [dev respondsToSelector:cu])
+                    ? ((BOOL (*)(id, SEL))objc_msgSend)(dev, cu) : NO;
+                ALog(@"  🔎 XCUIDevice configuredForUITesting = %d（0=XCUIApplication 用不了）", (int)cuOK);
+            }
+
+            // 12) 隐式事件确认间隔：**不再尝试修改**（原来那句必然抛 "Current context must not be nil"）
+            //   ★★ 2026-11-02 血泪：用 setImplicitEventConfirmationIntervalForCurrentContextWithoutSideEffects:
+            //     把它设成 0 **确实生效**（日志回读 = 0.000），但生效之后**每次点击都让进程直接闪退**
+            //     （01:41:06 提交 tap → 进程没了，没有任何异常日志）。XCTest 在这个值为 0 时会同步去
+            //     确认事件，内部状态没准备好就同归于尽。
+            //   ⇒ 保持默认 5s 不动。上面第 9 步已经把当前值打进日志，真要治「点一下要等」，
+            //     只能从减少 daemon 竞争 / 换采集通路入手，不要再碰这个开关。
+
+            // 13) FBConfiguration setWaitForIdleTimeout:0
+            Class fbCls = NSClassFromString(@"FBConfiguration");
+            SEL wid = NSSelectorFromString(@"setWaitForIdleTimeout:");
+            if (fbCls && [fbCls respondsToSelector:wid]) {
+                @try {
+                    void (*fp)(id, SEL, double) = (void (*)(id, SEL, double))objc_msgSend;
+                    fp(fbCls, wid, 0.0);
+                    ALog(@"  ✅ FBConfiguration.waitForIdleTimeout := 0");
+                } @catch (NSException *e) { ALog(@"  ❌ FBConfiguration: %@", e.reason); }
+            }
+
+            ALog(@"===== AXAgent bootstrap 完成 =====");
+            return YES;
+        }
+    } @catch (NSException *e) {
+        gLastError = [NSString stringWithFormat:@"bootstrap 异常 %@: %@", e.name, e.reason];
+        ALog(@"❌ %@", gLastError);
+        return NO;
+    }
+}
+
+#pragma mark - 4. 触控（与 ASAgen 同一条链）
+
+extern "C" BOOL AXAgentIsReady(void) { return gReady; }
+extern "C" NSString *AXAgentLastError(void) { return gLastError; }
+extern "C" NSString *AXAgentLogPath(void) { return AXLogPath(); }
+
+/* 清空运行日志（10010 的 {"cmd":"logclear"}）。
+   ★ 现在日志是每行 fopen→seek→write→close，文件只增不减，跑一天能到几十 MB，
+   PC 端拉日志也慢。这里直接截断成空文件（原子写，不留半截）。
+   截断前先记一条，方便确认"是我清的、不是日志丢了"。 */
+extern "C" BOOL AXAgentLogClear(long long *outFreedBytes) {
+    NSString *path = AXLogPath();
+    unsigned long long before = 0;
+    NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:NULL];
+    if (attr) before = [attr fileSize];
+
+    ALog(@"🧹 清空日志（清前 %.1f KB）", before / 1024.0);
+
+    NSError *err = nil;
+    BOOL ok = [[NSData data] writeToFile:path options:NSDataWritingAtomic error:&err];
+    if (outFreedBytes) *outFreedBytes = (long long)before;
+    if (!ok) ALog(@"❌ 清日志失败: %@", err.localizedDescription);
+    return ok;
+}
+
+extern "C" BOOL AXAgentBootstrapNow(void) {
+    return AXAgentBootstrap();
+}
+
+/* 单调时钟毫秒（AXNowMs 定义在文件后段，前面几处要先用） */
+static long long AXSeqMs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* ★ 当前前台 App 的 bundleID（SpringBoardServices 私有函数）。
+   b94 失败原因：`coordinateWithNormalizedOffset:` 是 **XCUIElement** 的方法，XCUIScreen 上没有，
+   所以拿不到坐标对象。正确姿势是 GCUIApplication(前台 App).coordinateWithNormalizedOffset →
+   tap：这样坐标落在该 App 的坐标空间里，daemon 的目标也是它，确认不会空等。 */
+static NSString *AXFrontBundleID(void) {
+    static CFStringRef (*fFront)(void) = NULL;
+    static BOOL tried = NO;
+    if (!tried) {
+        tried = YES;
+        void *h = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices",
+                         RTLD_LAZY);
+        if (h) fFront = (CFStringRef (*)(void))dlsym(h, "SBSCopyFrontmostApplicationDisplayIdentifier");
+        ALog(@"🔎 SpringBoardServices frontmost=%p", (void *)fFront);
+    }
+    if (!fFront) return nil;
+    CFStringRef s = fFront();
+    if (!s) return nil;
+    NSString *r = [(__bridge NSString *)s copy];
+    CFRelease(s);
+    return r;
+}
+
+/* ★ HID 触摸通道开关（b91）与入口前置声明：
+   AXAgentTap 在文件前段，触摸实现放在 HOME 附近（要用 AXSeqMs/日志），故先声明。 */
+/* ★ b94 默认**关**：b92/b93 实测 HID 的 digitizer 事件被系统静默丢弃（普通 App 进程没有
+   "来源认证"，键盘事件没这道校验所以 HOME 可用），开了等于点击全失效。
+   代码和开关都留着，将来有 senderID/BKSHIDEventSetDigitizerInfo 再启。
+   需要时发 {"cmd":"hidtap","on":1}。 */
+static volatile int g_hidTapOn = 1;
+static volatile int g_totalActionCount = 0;
+extern "C" int AXGetTotalActionCount(void) { return g_totalActionCount; }
+extern "C" BOOL AXAgentHIDTap(double x, double y);
+extern "C" BOOL AXAgentHIDTouch(double xPt, double yPt, int down);
+
+/* ★ 1 = daemon 里正压着一张截图（AXGrabEncodedData 置位、收到回包清零）。
+   合成手势前要等它回来，否则事件排在截图后面，连点时第二下会被挤掉。
+   定义必须放在 AXTapCore 之前（它要用）。 */
+static volatile int g_grabBusy = 0;
+
+/* ★★ 点击确认探针（2026-11-02，**只读，不改任何行为**）。
+   目的：确认「点一下就等 5 秒」到底卡在哪一段。XCTest 合成一笔事件后要等 daemon
+   回报确认（草稿默认 5 秒，日志里 implicitEventConfirmationInterval = 5.000）。
+   这里记录三件事：
+     g_tapSynAt  提交 synthesizeEvent 的时刻
+     g_tapCfmAt  completion 回调回来的时刻
+     g_tapCfmMs  两者之差 = daemon 真正处理完这笔点击花了多久
+   ★ 回调块里只写 C 静态变量，绝不捕获任何 ObjC 对象（b35/b36 的 SIGSEGV 教训）。 */
+static volatile long long g_tapSynAt  = 0;
+static volatile long long g_tapCfmAt  = 0;
+static volatile long long g_tapCfmMs  = -1;   /* 提交→确认 耗时 */
+static volatile long long g_tapGapMs  = -1;   /* 相邻两次点击提交的间隔 */
+static volatile int       g_tapSynN   = 0;    /* 提交次数 */
+static volatile int       g_tapCfmN   = 0;    /* 确认回调次数 */
+static volatile int       g_tapCfmErr = 0;    /* 确认带错（daemon 拒绝）的次数 */
+
+/* 核心实现（提交完立刻返回，不等待）。控制通道必须用这个 ——
+   控制线程是串行的，这里一阻塞，后面的点击/滑动全在队列里排队，
+   表现就是"点了半天才反应"。 */
+static BOOL AXTapCore(double x, double y) {
+    if (!gReady || !gSession) {
+        ALog(@"❌ tap 失败：会话未就绪");
+        return NO;
+    }
+    @try {
+        /* ★★★ 2026-11-02 b90：`...ForCurrentContext` 这一族是**线程局部**的！
+           bootstrap 在启动线程设 0.05（日志回读确实 0.050），但点击跑在控制线程，
+           那一侧的 context 还是默认 **5.000** ⇒ 每笔点击仍然干等 4.5 秒
+           （b89 日志实证：`确认=4477ms err=1`，用户感受就是"按完 HOME 点一下要等 5 秒"）。
+           所以必须在**真正合成事件的那条线程**上再设一次。只设一次，之后跟着线程走。 */
+        static BOOL s_cfmInit = NO;
+        if (!s_cfmInit) {
+            s_cfmInit = YES;
+            SEL s3 = NSSelectorFromString(@"setImplicitEventConfirmationIntervalForCurrentContextWithoutSideEffects:");
+            SEL rd = NSSelectorFromString(@"implicitEventConfirmationIntervalForCurrentContext");
+            @try {
+                double before = [gSession respondsToSelector:rd]
+                    ? ((double (*)(id, SEL))objc_msgSend)(gSession, rd) : -1;
+                ((void (*)(id, SEL, double))objc_msgSend)(gSession, s3, 0.02);
+                double after = [gSession respondsToSelector:rd]
+                    ? ((double (*)(id, SEL))objc_msgSend)(gSession, rd) : -1;
+                ALog(@"⚙️ tap 线程确认间隔 %.3f → %.3f（b96 降到 0.02，实测 0.05 仍要 ~325ms）", before, after);
+            } @catch (NSException *e) {
+                ALog(@"⚠️ tap 线程确认间隔设置失败：%@", e.reason);
+            }
+        }
+
+        /* ★★★ 2026-11-02 b94：先试 **XCUICoordinate.tap**。
+           b91~b93 的 HID 直发在 App 进程里被 backboardd 判"来源无效"（不报错、静默丢弃），
+           键盘事件没这层校验所以 HOME 能用、触摸不能，这条路先放弃。
+           裸 XCSynthesizedEventRecord 的问题是**没有目标 App 上下文**，daemon 的确认永远失败
+           （日志：确认 3000~4000ms、err 一路累加）⇒ 每点一下等 4 秒。
+           XCUICoordinate 走 XCUIElement 那套事件生成器，daemon 能把它归到当前前台 App，
+           这就是 WDA 点击不慢的原因。坐标用「屏幕归一化偏移」，不绑定具体元素。 */
+        static int s_coordMode = -1;   /* -1 未试 / 1 可用 / 0 不可用 */
+        if (s_coordMode != 0) {
+            @try {
+                NSString *bid = AXFrontBundleID();
+                /* ★★★ b97：查到空就**用 SpringBoard 兜底**，绝不放弃。
+                   b95/b96 在这里 `if (bid.length && ...)` 直接跳过 ⇒ app-coord 一次都没跑过。
+                   SpringBoard 是"系统级"页面：它的归一化坐标就是整屏坐标，事件由系统按
+                   屏幕坐标路由给当前前台 App，同时 daemon 的目标也变成 SpringBoard ——
+                   HOME 之后前台正是它，所以那笔事件不用再等"后台的 hbVideo"确认。
+                   ★ 查不到前台时也无脑用它：比绑死在后台的自己强。 */
+                if (!bid.length) bid = @"com.apple.springboard";
+                Class appCls = NSClassFromString(@"XCUIApplication");
+                SEL ini = NSSelectorFromString(@"initWithBundleIdentifier:");
+                SEL cno = NSSelectorFromString(@"coordinateWithNormalizedOffset:");
+                SEL tapSel = NSSelectorFromString(@"tap");
+                id app = (appCls && [appCls instancesRespondToSelector:ini])
+                    ? ((id (*)(id, SEL, id))objc_msgSend)([appCls alloc], ini, bid) : nil;
+                if (app && [app respondsToSelector:cno]) {
+                    UIScreen *us = [UIScreen mainScreen];
+                    CGSize sz = us ? us.bounds.size : CGSizeMake(1, 1);
+                    double w = sz.width > 0 ? sz.width : 1, h = sz.height > 0 ? sz.height : 1;
+                    CGVector off = CGVectorMake(x / w, y / h);
+                    long long t0 = AXSeqMs();
+                    id coord = ((id (*)(id, SEL, CGVector))objc_msgSend)(app, cno, off);
+                    if (coord && [coord respondsToSelector:tapSel]) {
+                        ((void (*)(id, SEL))objc_msgSend)(coord, tapSel);
+                        s_coordMode = 1;
+                        ALog(@"👆 app-coord tap %@ (%.1f,%.1f) 同步 %lldms",
+                             bid, x, y, AXSeqMs() - t0);
+                        return YES;
+                    }
+                }
+                s_coordMode = 0;
+                ALog(@"⚠️ app-coord 不可用（bid=%@），回退 synthesizeEvent", bid ?: @"nil");
+            } @catch (NSException *e) {
+                s_coordMode = 0;
+                ALog(@"⚠️ app-coord 异常 %@，回退 synthesizeEvent", e.reason);
+            }
+        }
+        Class pathCls = NSClassFromString(@"XCPointerEventPath");
+        Class recCls = NSClassFromString(@"XCSynthesizedEventRecord");
+        if (!pathCls || !recCls) {
+            ALog(@"❌ tap 失败：XCPointerEventPath/XCSynthesizedEventRecord 不存在");
+            return NO;
+        }
+        SEL initPath = NSSelectorFromString(@"initForTouchAtPoint:offset:");
+        id (*fp1)(id, SEL, CGPoint, double) = (id (*)(id, SEL, CGPoint, double))objc_msgSend;
+        id path = fp1([pathCls alloc], initPath, CGPointMake(x, y), 0.0);
+        if (!path) { ALog(@"❌ tap：path 构造失败"); return NO; }
+
+        /* ★★ 必须显式抬手（2026-11-01 用户反馈「点击之间必须隔一下才能点第二下」）。
+           以前这里只建了「按下」就提交，record 里这根手指**永远没有 lift**：
+           daemon 只能自己猜什么时候松手 —— 第二下点提交上去时上一次还没收尾，
+           就表现成「第二下点不上、要等一会儿」。文件里其它路径（手势/双指/touchSeq）
+           都调了 liftUpAtOffset:，唯独 tap 这条漏了。
+           ★ 抬手时刻取 50~80ms 随机（用户指定）：真人点按时长天然有抖动，
+             固定值会让连点/长按判定过于机械、也更容易两下之间撞在同一时刻。 */
+        SEL upSel = NSSelectorFromString(@"liftUpAtOffset:");
+        if ([path respondsToSelector:upSel]) {
+            int holdMs = 50 + (int)arc4random_uniform(31);   /* 31 → 0..30 ⇒ 50~80ms */
+            ((void (*)(id, SEL, double))objc_msgSend)(path, upSel, (double)holdMs / 1000.0);
+        } else {
+            ALog(@"⚠️ tap：XCPointerEventPath 无 liftUpAtOffset:，本次只有按下没有抬起");
+        }
+
+        long orient = AXInterfaceOrientation();
+        SEL initRec = NSSelectorFromString(@"initWithName:interfaceOrientation:");
+        id (*fp2)(id, SEL, id, long) = (id (*)(id, SEL, id, long))objc_msgSend;
+        id rec = fp2([recCls alloc], initRec, @"AXAgent", orient);
+        if (!rec) { ALog(@"❌ tap：record 构造失败"); return NO; }
+
+        SEL addPath = NSSelectorFromString(@"addPointerEventPath:");
+        void (*fp3)(id, SEL, id) = (void (*)(id, SEL, id))objc_msgSend;
+        fp3(rec, addPath, path);
+
+        // completion 块绝不能捕获任何 ObjC 对象（__block 变量在函数返回后会失效，
+        // XPC 回调再来时 objc_retain 野指针直接 SIGSEGV —— b35/b36 就是这个崩的）
+        // ★ b77 曾在这里加过 if (err) ALogShim(...)，b79 撤回：保持空块最安全。
+        void (^completion)(id) = ^(id err) {
+            /* ★ 探针：只写 C 静态变量，不捕获/不 retain/不调任何 ObjC 方法 */
+            long long t = AXSeqMs();
+            g_tapCfmAt = t;
+            g_tapCfmMs = (g_tapSynAt > 0) ? (t - g_tapSynAt) : -1;
+            if (err) g_tapCfmErr++;
+            g_tapCfmN++;
+        };
+        SEL syn = NSSelectorFromString(@"synthesizeEvent:completion:");
+        if (![gSession respondsToSelector:syn]) {
+            ALog(@"❌ tap：daemonSession 无 synthesizeEvent:completion:");
+            return NO;
+        }
+        /* b77 曾在这里等 daemon 手上那张截图回来（≤80ms），后来证明真因不是 daemon 忙，
+           而是 implicitEventConfirmationInterval=5s 没设成 0（见 bootstrap 第 12 步）。
+           那 80ms 等待反而给每一下点击加了延迟，已撤掉。 */
+
+        /* ★★★ 2026-11-02 照 AScript 的做法改（从其 IPA 主程序字符串提取）：
+          它用的是同两个私有重载 —— `_XCT_synthesizeEvent:completion:` /
+          `_XCT_synthesizeEvent:implicitConfirmationInterval:completion:`，
+          会话同样是 `[XCTRunnerDaemonSession sharedSession]`（我们一样）。
+          唯一差别：**它不管 respondsToSelector，直接发消息**。
+          我们之前用 respondsToSelector 探测得到 NO 就放弃了 —— 但 XCTest 这套是消息转发实现的，
+          探测返回 NO 并不代表不能发。这里改成"直接发 + @try 兜底"：
+          抛异常就永久降级到下一个入口，绝不会拿你的点击反复试崩。 */
+        static int s_synMode = -1;   /* -1=未定  2=_XCT_带间隔  1=_XCT_  0=普通 */
+        static BOOL s_synLogged = NO;
+        SEL synX2 = NSSelectorFromString(@"_XCT_synthesizeEvent:implicitConfirmationInterval:completion:");
+        SEL synX1 = NSSelectorFromString(@"_XCT_synthesizeEvent:completion:");
+        if (s_synMode < 0) s_synMode = 2;
+        void (*fp4)(id, SEL, id, id) = (void (*)(id, SEL, id, id))objc_msgSend;
+        void (*fp5)(id, SEL, id, double, id) = (void (*)(id, SEL, id, double, id))objc_msgSend;
+        /* ★ 探针：记下提交时刻 + 与上一笔点击的间隔（确认耗时在 completion 里回填） */
+        g_tapGapMs = (g_tapSynAt > 0) ? (AXSeqMs() - g_tapSynAt) : -1;
+        g_tapSynAt = AXSeqMs();
+        g_tapSynN++;
+        long long synT0 = AXSeqMs();
+        BOOL sent = NO;
+        if (s_synMode == 2) {
+            @try {
+                fp5(gSession, synX2, rec, 0.02, completion);
+                sent = YES;
+                if (!s_synLogged) {
+                    s_synLogged = YES;
+                    ALog(@"🧷 合成事件走 _XCT_synthesizeEvent:implicitConfirmationInterval:completion:（0.02s）");
+                }
+            } @catch (NSException *e) {
+                s_synMode = 1;
+                ALog(@"⚠️ _XCT_ 带间隔重载不可用（%@）→ 退 _XCT_synthesizeEvent:completion:", e.reason);
+            }
+        }
+        if (!sent && s_synMode == 1) {
+            @try {
+                fp4(gSession, synX1, rec, completion);
+                sent = YES;
+                if (!s_synLogged) {
+                    s_synLogged = YES;
+                    ALog(@"🧷 合成事件走 _XCT_synthesizeEvent:completion:（无独立间隔）");
+                }
+            } @catch (NSException *e) {
+                s_synMode = 0;
+                ALog(@"⚠️ _XCT_synthesizeEvent:completion: 也不可用（%@）→ 退普通入口", e.reason);
+            }
+        }
+        if (!sent) {
+            fp4(gSession, syn, rec, completion);
+            if (!s_synLogged) {
+                s_synLogged = YES;
+                ALog(@"🧷 合成事件退回普通入口 synthesizeEvent:completion:（确认间隔=全局）");
+            }
+        }
+        long long synMs = AXSeqMs() - synT0;
+        /* 合成调用本身若很慢（>100ms），说明卡在 daemon 或 CPU 被采集循环占满 */
+        if (synMs > 100) ALog(@"⏱ tap 合成耗时 %lldms（CPU 忙/daemon 慢）", synMs);
+        else ALog(@"  ✅ tap(%.1f, %.1f) 已提交（%lldms） 间隔=%lldms 上次确认=%lldms 确认数=%d/%d 错误=%d",
+                  x, y, synMs, g_tapGapMs, g_tapCfmMs, g_tapCfmN, g_tapSynN, g_tapCfmErr);
+        return YES;
+    } @catch (NSException *e) {
+        ALog(@"❌ tap 异常: %@ / %@", e.name, e.reason);
+        return NO;
+    }
+}
+
+/* 对外的 tap：给 10010 用，提交后等 0.1 秒让手势走完再回包 */
+extern "C" BOOL AXAgentTap(double x, double y) {
+    /* b91：HID 通道开着就直接走 HID —— 0ms 入队、无确认、无目标切换 */
+    if (g_hidTapOn != 0 && AXAgentHIDTap(x, y)) return YES;
+    BOOL ok = AXTapCore(x, y);
+    if (ok) [NSThread sleepForTimeInterval:0.1];
+    return ok;
+}
+
+/// 在永不退出、且不 pop autorelease pool 的线程里跑 bootstrap：
+/// XCTest 内部创建的 XPC 连接不会被释放，避免 _xpc_api_misuse 崩溃。
+/* 正在 bootstrap 的标志：防止连点「重建会话」叠加多条常驻线程、反复覆盖 gSession */
+static volatile int gStickyBusy = 0;
+
+extern "C" BOOL AXAgentIsBootstrapping(void) {
+    return gStickyBusy != 0;
+}
+
+extern "C" void AXAgentStartSticky(void) {
+    /* ★ 原子占位：已经在建就忽略（返回 YES 表示"这次没建"由调用方提示） */
+    if (__sync_lock_test_and_set(&gStickyBusy, 1)) {
+        ALog(@"⏳ 会话正在建立中，忽略重复的 bootstrap 请求");
+        return;
+    }
+    NSThread *t = [[NSThread alloc] initWithBlock:^{
+        ALog(@"常驻线程启动，开始 bootstrap");
+        AXAgentBootstrap();
+        __sync_lock_release(&gStickyBusy);   /* 建完（无论成败）放开，允许失败后重试 */
+        while (YES) { [NSThread sleepForTimeInterval:86400.0]; }
+    }];
+    t.name = @"AXAgent-Sticky";
+    [t start];
+}
+
+
+#pragma mark - 5. 手势（swipe / longpress / 任意轨迹）
+
+/// xy: [x0,y0, x1,y1, ...]  t: 每个点的时间偏移(秒)，最后一个点是 liftUp
+/* 按 Home 键（用自动化会话里的 XCUIDevice.pressButton:），用于自己复现"退到后台" */
+/* ★★★ 2026-11-02 b89：**纯 HID 直发 HOME**（真正绕开 XCTest 全部通道）。
+   为什么还要再来一条：XCDeviceEvent + 会话 performDeviceEvent 在 hometest 探针里
+   "看起来有效"（提交 0~1ms），但真机按 HOME 仍不回桌面 —— 因为事件只是交给了
+   XCTest 的 daemon，还要过它的确认与目标切换（目标一直挂在 hbVideo 上）。
+   hometest mode 4 之所以"有效"，靠的正是探针里那 200ms 的等待 + 之后人眼看桌面。
+   这里直接把「硬件按键」塞进系统 HID 流，不经过任何测试框架：
+     IOHIDEventCreateKeyboardEvent(0, kHIDPage_Consumer=0x0C, usage=0x40(Menu), down/up)
+     IOHIDEventSystemClientDispatchEvent(client, event)
+   代价：需要 com.apple.private.hid.client.event-dispatch（TrollStore 签名是否给未知），
+   失败时 dispatch 无返回值（静默），所以下面保留探测 + 逐级降级。 */
+typedef void *(*AXHIDKbFn)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, unsigned char);
+
+extern "C" BOOL AXAgentHomeHID(long usage) {
+    static AXHIDKbFn fCreate = NULL;
+    static void *(*fClientCreate)(CFAllocatorRef) = NULL;
+    static void (*fDispatch)(void *, void *) = NULL;
+    static void *s_client = NULL;
+    static BOOL s_inited = NO;
+    static BOOL s_ok = NO;
+    if (!s_inited) {
+        s_inited = YES;
+        void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY | RTLD_GLOBAL);
+        void *scope = h ? h : RTLD_DEFAULT;
+        fCreate       = (AXHIDKbFn)dlsym(scope, "IOHIDEventCreateKeyboardEvent");
+        fClientCreate = (void *(*)(CFAllocatorRef))dlsym(scope, "IOHIDEventSystemClientCreate");
+        fDispatch     = (void (*)(void *, void *))dlsym(scope, "IOHIDEventSystemClientDispatchEvent");
+        if (!fClientCreate) {
+            /* iOS 13+ 只有带 type 的版本：IOHIDEventSystemClientCreateWithType(alloc, type, props)
+               type=1 是 Monitor 客户端（能收发事件）。★ 必须按 3 参数调用，少一个参数会崩。 */
+            void *(*f2)(CFAllocatorRef, int, CFDictionaryRef) =
+                (void *(*)(CFAllocatorRef, int, CFDictionaryRef))dlsym(scope, "IOHIDEventSystemClientCreateWithType");
+            if (f2) s_client = f2(kCFAllocatorDefault, 1, NULL);
+        } else {
+            s_client = fClientCreate(kCFAllocatorDefault);
+        }
+        s_ok = (fCreate && fDispatch && s_client);
+        ALog(@"🔧 HID 直发初始化：IOKit=%p create=%p client=%p(%p) dispatch=%p → %s",
+             h, (void *)fCreate, (void *)fClientCreate, s_client, (void *)fDispatch,
+             s_ok ? "可用" : "不可用");
+    }
+    if (!s_ok) return NO;
+    long long t0 = AXSeqMs();
+    void *down = fCreate(kCFAllocatorDefault, 0, 0x0C, (uint32_t)usage, 1);
+    void *up   = fCreate(kCFAllocatorDefault, 0, 0x0C, (uint32_t)usage, 0);
+    if (!down || !up) { ALog(@"❌ HID 事件构造失败 down=%p up=%p", down, up); return NO; }
+    fDispatch(s_client, down);
+    usleep(30 * 1000);
+    fDispatch(s_client, up);
+    ALog(@"🏠 home = 纯 HID 直发 page=0x0C usage=0x%lx（%lldms，不等确认）", usage, AXSeqMs() - t0);
+    return YES;
+}
+
+/* ★★★ 2026-11-02 b91：**HID 直发触摸**（绕开 XCTest 合成链）。
+   为什么必须换：b89/b90 日志实证 —— `synthesizeEvent:completion:` 每笔的确认**全部失败**
+   （err 一直涨），耗时 0.5~4 秒随机，那就是 daemon 等一个永远不会来的确认。
+   确认间隔设 0.05 也没用（回读确实是 0.05，控制线程上也是 0.05，证明不是设置问题）。
+   根因是 XCTest 的事件通道要"目标 App 在场确认"，而我们的会话目标固定是 hbVideo 自己。
+   HID 这条不走测试框架：IOHIDEventCreateDigitizerFingerEvent → hand 容器 →
+   IOHIDEventSystemClientDispatchEvent，事件直接进系统触摸流，没有确认、没有目标、0 等待。
+   ★ 坐标：XCPointerEventPath 用 point，HID digitizer 用**屏幕像素** ⇒ × nativeScale。
+
+   ★★★ b93 修正两处**函数签名错误**（对照 rpcclient / ZXTouch 的 ctypes 定义核过）：
+     IOHIDEventCreateDigitizerEvent(alloc, ts, type, index, identityMask, eventMask,
+         childEventMask, x, y, z, tipPressure, barrelPressure, range, touch, options)   ← 15 个
+     IOHIDEventCreateDigitizerFingerEvent(alloc, ts, index, identity, eventMask, buttonMask,
+         x, y, z, tipPressure, twist, range, touch, options)                            ← 14 个
+   b91 的 finger 少写了 buttonMask、父事件多写了一个 isAbsolute ⇒ 后面 x/y/pressure
+   整体错位，事件发出去也不是"一个点在 (x,y) 的触摸"，系统直接无视。
+   还补上关键的 kIOHIDEventFieldDigitizerIsDisplayIntegrated=1（不设这标记，系统不认这是屏幕触摸）。 */
+typedef void *(*AXHIDDigitizerFn)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t,
+                                  uint32_t, uint32_t, double, double, double,
+                                  double, double, int, int, uint32_t);
+typedef void *(*AXHIDFingerFn)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t,
+                               uint32_t, double, double, double, double,
+                               double, int, int, uint32_t);
+typedef void  (*AXHIDAppendFn)(void *, void *);
+typedef void  (*AXHIDDispatchFn)(void *, void *);
+typedef void *(*AXHIDClientFn)(CFAllocatorRef);
+typedef void *(*AXHIDClientWithTypeFn)(CFAllocatorRef, int, CFDictionaryRef);
+typedef void  (*AXHIDSetIntFn)(void *, uint32_t, int64_t);
+typedef void  (*AXHIDSetFloatFn)(void *, uint32_t, double);
+typedef void  (*AXHIDSetSenderIDFn)(void *, uint64_t);
+typedef uint64_t (*AXHIDGetSenderIDFn)(void *);
+typedef uint32_t (*AXHIDGetTypeFn)(void *);
+typedef CFArrayRef (*AXHIDCopyServicesFn)(void *);
+typedef CFTypeRef  (*AXHIDSvcGetRegIDFn)(void *);
+typedef CFTypeRef  (*AXHIDSvcCopyPropFn)(void *, CFStringRef);
+typedef void  (*AXHIDScheduleRunLoopFn)(void *, CFRunLoopRef, CFStringRef);
+typedef void  (*AXHIDRegCallbackFn)(void *, void *, void *, void *);
+
+/* IOHIDEventField（digitizer 基址 0x000B0000） */
+static const uint32_t kAxFieldMajorRadius  = 0x000B0014;
+static const uint32_t kAxFieldMinorRadius  = 0x000B0015;
+static const uint32_t kAxFieldDisplayInteg = 0x000B001A;
+static const uint32_t kAxFieldIsBuiltIn    = 0x000B0019;
+
+static void *g_tchClient   = NULL;
+static AXHIDFingerFn        fFingerEvt     = NULL;
+static AXHIDDigitizerFn     fHandEvt       = NULL;
+static AXHIDAppendFn        fEvtAppend     = NULL;
+static AXHIDDispatchFn      fEvtDispatch   = NULL;
+static AXHIDSetIntFn        fEvtSetInt     = NULL;
+static AXHIDSetFloatFn      fEvtSetFloat   = NULL;
+static AXHIDSetSenderIDFn   fEvtSetSender  = NULL;
+static AXHIDGetSenderIDFn   fEvtGetSender  = NULL;
+static AXHIDGetTypeFn       fEvtGetType    = NULL;
+static volatile uint64_t    g_touchSenderID = 0;
+static int  g_hidTouchInit = 0;      /* 0=未试 1=可用 -1=不可用 */
+
+/* 监听系统真实触摸事件，实时捕获 100% 准确的硬件触摸屏 SenderID */
+static void AXHIDEventSpyCallback(void *target, void *refcon, void *sender, void *event) {
+    (void)target; (void)refcon; (void)sender;
+    if (!event || !fEvtGetSender || !fEvtGetType) return;
+    uint32_t t = fEvtGetType(event);
+    if (t == 11) { /* kIOHIDEventTypeDigitizer = 11 */
+        uint64_t sid = fEvtGetSender(event);
+        if (sid != 0 && sid != g_touchSenderID) {
+            g_touchSenderID = sid;
+            ALog(@"🎯 捕获到真实屏幕触摸 SenderID = 0x%llX", (unsigned long long)sid);
+        }
+    }
+}
+
+static void AXDiscoverTouchSenderID(void *scope) {
+    if (!g_tchClient) return;
+    AXHIDCopyServicesFn fCopySvcs = (AXHIDCopyServicesFn)dlsym(scope, "IOHIDEventSystemClientCopyServices");
+    AXHIDSvcGetRegIDFn  fGetRegID = (AXHIDSvcGetRegIDFn)dlsym(scope, "IOHIDServiceClientGetRegistryID");
+    AXHIDSvcCopyPropFn  fCopyProp = (AXHIDSvcCopyPropFn)dlsym(scope, "IOHIDServiceClientCopyProperty");
+    if (fCopySvcs && fGetRegID) {
+        CFArrayRef svcs = fCopySvcs(g_tchClient);
+        if (svcs) {
+            CFIndex cnt = CFArrayGetCount(svcs);
+            uint64_t fallbackSid = 0;
+            for (CFIndex i = 0; i < cnt; i++) {
+                void *svc = (void *)CFArrayGetValueAtIndex(svcs, i);
+                if (!svc) continue;
+                CFTypeRef regObj = fGetRegID(svc);
+                uint64_t sid = 0;
+                if (regObj && CFGetTypeID(regObj) == CFNumberGetTypeID()) {
+                    CFNumberGetValue((CFNumberRef)regObj, kCFNumberSInt64Type, &sid);
+                }
+                if (sid == 0) continue;
+                int usagePage = 0, usage = 0, builtIn = 0;
+                if (fCopyProp) {
+                    CFTypeRef up = fCopyProp(svc, CFSTR("PrimaryUsagePage"));
+                    if (up && CFGetTypeID(up) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)up, kCFNumberIntType, &usagePage);
+                    if (up) CFRelease(up);
+                    CFTypeRef u = fCopyProp(svc, CFSTR("PrimaryUsage"));
+                    if (u && CFGetTypeID(u) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)u, kCFNumberIntType, &usage);
+                    if (u) CFRelease(u);
+                    CFTypeRef bi = fCopyProp(svc, CFSTR("Built-In"));
+                    if (bi && CFGetTypeID(bi) == CFBooleanGetTypeID()) builtIn = CFBooleanGetValue((CFBooleanRef)bi) ? 1 : 0;
+                    else if (bi && CFGetTypeID(bi) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)bi, kCFNumberIntType, &builtIn);
+                    if (bi) CFRelease(bi);
+                }
+                ALog(@"  🔎 HID Service[%ld]: sid=0x%llX page=0x%X usage=0x%X builtIn=%d",
+                     (long)i, (unsigned long long)sid, usagePage, usage, builtIn);
+                /* Digitizer page = 0x0D (13), TouchScreen usage = 4 */
+                if (usagePage == 13 && (usage == 4 || usage == 5 || builtIn)) {
+                    g_touchSenderID = sid;
+                } else if (usagePage == 13 && fallbackSid == 0) {
+                    fallbackSid = sid;
+                }
+            }
+            if (g_touchSenderID == 0 && fallbackSid != 0) g_touchSenderID = fallbackSid;
+            CFRelease(svcs);
+        }
+    }
+    /* 注册 RunLoop 回调，用户一旦触碰屏幕立即锁定真实 SenderID */
+    AXHIDScheduleRunLoopFn fSched = (AXHIDScheduleRunLoopFn)dlsym(scope, "IOHIDEventSystemClientScheduleWithRunLoop");
+    AXHIDRegCallbackFn     fRegCb = (AXHIDRegCallbackFn)dlsym(scope, "IOHIDEventSystemClientRegisterEventCallback");
+    if (fSched && fRegCb) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            fSched(g_tchClient, CFRunLoopGetMain(), kCFRunLoopCommonModes);
+            fRegCb(g_tchClient, (void *)AXHIDEventSpyCallback, NULL, NULL);
+        });
+    }
+}
+
+static int AXHIDTouchInit(void) {
+    if (g_hidTouchInit != 0) return g_hidTouchInit;
+    g_hidTouchInit = -1;
+    void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY | RTLD_GLOBAL);
+    void *scope = h ? h : RTLD_DEFAULT;
+    AXHIDClientWithTypeFn fCliType = (AXHIDClientWithTypeFn)dlsym(scope, "IOHIDEventSystemClientCreateWithType");
+    AXHIDClientFn         fCli     = (AXHIDClientFn)dlsym(scope, "IOHIDEventSystemClientCreate");
+    fFingerEvt    = (AXHIDFingerFn)dlsym(scope, "IOHIDEventCreateDigitizerFingerEvent");
+    fHandEvt      = (AXHIDDigitizerFn)dlsym(scope, "IOHIDEventCreateDigitizerEvent");
+    fEvtAppend    = (AXHIDAppendFn)dlsym(scope, "IOHIDEventAppendEvent");
+    fEvtDispatch  = (AXHIDDispatchFn)dlsym(scope, "IOHIDEventSystemClientDispatchEvent");
+    fEvtSetInt    = (AXHIDSetIntFn)dlsym(scope, "IOHIDEventSetIntegerValue");
+    fEvtSetFloat  = (AXHIDSetFloatFn)dlsym(scope, "IOHIDEventSetFloatValue");
+    fEvtSetSender = (AXHIDSetSenderIDFn)dlsym(scope, "IOHIDEventSetSenderID");
+    fEvtGetSender = (AXHIDGetSenderIDFn)dlsym(scope, "IOHIDEventGetSenderID");
+    fEvtGetType   = (AXHIDGetTypeFn)dlsym(scope, "IOHIDEventGetType");
+
+    /* iOS 13~15 优先使用 CreateWithType(alloc, 1=Monitor/Admin, NULL) */
+    if (fCliType) {
+        g_tchClient = fCliType(kCFAllocatorDefault, 1, NULL);
+        if (!g_tchClient) g_tchClient = fCliType(kCFAllocatorDefault, 0, NULL);
+    }
+    if (!g_tchClient && fCli) {
+        g_tchClient = fCli(kCFAllocatorDefault);
+    }
+    if (fFingerEvt && fEvtDispatch && fHandEvt && g_tchClient) {
+        g_hidTouchInit = 1;
+        AXDiscoverTouchSenderID(scope);
+    }
+    UIScreen *sc = [UIScreen mainScreen];
+    ALog(@"🔧 HID 触摸初始化：client=%p senderID=0x%llX finger=%p hand=%p dispatch=%p "
+         "屏=%dx%d scale=%.2f → %s",
+         g_tchClient, (unsigned long long)g_touchSenderID, (void *)fFingerEvt, (void *)fHandEvt,
+         (void *)fEvtDispatch,
+         sc ? (int)sc.bounds.size.width : 0, sc ? (int)sc.bounds.size.height : 0,
+         sc ? (double)sc.nativeScale : 0,
+         g_hidTouchInit == 1 ? "可用" : "不可用");
+    return g_hidTouchInit;
+}
+
+/* mode: 1=按下(down), 2=移动(move), 0=抬起(up)
+   nx, ny 为 [0.0 .. 1.0] 屏幕归一化坐标 */
+static BOOL AXHIDPostFinger(double nx, double ny, int mode) {
+    uint64_t ts = mach_absolute_time();
+    int isTouch = (mode != 0) ? 1 : 0;
+    /* kIOHIDDigitizerEventRange=0x01, Touch=0x02, Position=0x04 */
+    uint32_t fmask = (mode == 1) ? 0x07u : ((mode == 2) ? 0x04u : 0x03u);
+    uint32_t hmask = (mode == 1) ? 0x07u : ((mode == 2) ? 0x04u : 0x03u);
+    double pressure = isTouch ? 0.85 : 0.0;
+
+    void *hand = fHandEvt(kCFAllocatorDefault, ts,
+                          /*type*/ 3 /*kIOHIDDigitizerTransducerTypeHand*/,
+                          /*index*/ 0, /*identity*/ 0,
+                          /*eventMask*/ hmask, /*buttonMask*/ 0,
+                          nx, ny, 0.0, pressure, 0.0,
+                          /*range*/ isTouch, /*touch*/ isTouch, /*options*/ 0);
+    if (!hand) { ALog(@"❌ HID 触摸：hand 构造失败"); return NO; }
+
+    void *finger = fFingerEvt(kCFAllocatorDefault, ts,
+                              /*index*/ 1, /*identity*/ 2, /*eventMask*/ fmask,
+                              /*buttonMask*/ 0,
+                              nx, ny, 0.0,
+                              /*tipPressure*/ pressure,
+                              /*twist*/ 0.0,
+                              /*range*/ isTouch, /*touch*/ isTouch,
+                              /*options*/ 0);
+    if (!finger) { CFRelease(hand); ALog(@"❌ HID 触摸：finger 构造失败"); return NO; }
+
+    if (fEvtSetFloat) {
+        fEvtSetFloat(finger, kAxFieldMajorRadius, 5.0);
+        fEvtSetFloat(finger, kAxFieldMinorRadius, 5.0);
+    }
+    if (fEvtSetInt) {
+        fEvtSetInt(finger, kAxFieldDisplayInteg, 1);
+        fEvtSetInt(finger, kAxFieldIsBuiltIn, 1);
+    }
+    fEvtAppend(hand, finger);
+    if (fEvtSetInt) {
+        fEvtSetInt(hand, kAxFieldDisplayInteg, 1);
+        fEvtSetInt(hand, kAxFieldIsBuiltIn, 1);
+    }
+    if (fEvtSetSender && g_touchSenderID != 0) {
+        fEvtSetSender(finger, g_touchSenderID);
+        fEvtSetSender(hand, g_touchSenderID);
+    }
+    fEvtDispatch(g_tchClient, hand);
+    CFRelease(finger);
+    CFRelease(hand);
+    return YES;
+}
+
+/* down: 1=按下, 2=移动, 0=抬起。输入 xPt, yPt 为屏幕点坐标 (例如 414x736) */
+extern "C" BOOL AXAgentHIDTouch(double xPt, double yPt, int down) {
+    if (AXHIDTouchInit() != 1) return NO;
+    @try {
+        UIScreen *sc = [UIScreen mainScreen];
+        double sw = sc ? (double)sc.bounds.size.width : 414.0;
+        double sh = sc ? (double)sc.bounds.size.height : 736.0;
+        if (sw <= 1.0) sw = 414.0;
+        if (sh <= 1.0) sh = 736.0;
+        double nx = xPt / sw;
+        double ny = yPt / sh;
+        if (nx < 0.001) nx = 0.001;
+        if (nx > 0.999) nx = 0.999;
+        if (ny < 0.001) ny = 0.001;
+        if (ny > 0.999) ny = 0.999;
+        static int s_logCnt = 0;
+        if (s_logCnt < 5) {
+            s_logCnt++;
+            ALog(@"👆 HID 触控[%d]：pt(%.1f, %.1f) → norm(%.4f, %.4f) sender=0x%llX",
+                 down, xPt, yPt, nx, ny, (unsigned long long)g_touchSenderID);
+        }
+        return AXHIDPostFinger(nx, ny, down);
+    } @catch (NSException *e) {
+        ALog(@"⚠️ HID 触摸异常：%@", e.reason);
+        return NO;
+    }
+}
+
+static dispatch_queue_t AXHIDTouchQueue(void) {
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("ax.hid.touch", DISPATCH_QUEUE_SERIAL);
+    });
+    return q;
+}
+
+extern "C" BOOL AXAgentHIDTap(double x, double y) {
+    if (AXHIDTouchInit() != 1) return NO;
+    g_totalActionCount++;
+    long long t0 = AXSeqMs();
+    dispatch_async(AXHIDTouchQueue(), ^{
+        AXAgentHIDTouch(x, y, 1);
+        usleep(55 * 1000);
+        AXAgentHIDTouch(x, y, 0);
+    });
+    ALog(@"👆 hidtap(%.1f, %.1f) 已派发（%lldms）累计动作=%d", x, y, AXSeqMs() - t0, g_totalActionCount);
+    return YES;
+}
+
+static BOOL AXAgentHIDSwipe(double x1, double y1, double x2, double y2, double dur) {
+    if (AXHIDTouchInit() != 1) return NO;
+    g_totalActionCount++;
+    if (dur < 0.08) dur = 0.25;
+    if (dur > 3.0)  dur = 3.0;
+    int steps = 16;
+    useconds_t stepUs = (useconds_t)((dur * 1000000.0) / steps);
+    dispatch_async(AXHIDTouchQueue(), ^{
+        AXAgentHIDTouch(x1, y1, 1);
+        usleep(12 * 1000);
+        for (int i = 1; i <= steps; i++) {
+            double k = (double)i / (double)steps;
+            double cx = x1 + (x2 - x1) * k;
+            double cy = y1 + (y2 - y1) * k;
+            AXAgentHIDTouch(cx, cy, 2);
+            usleep(stepUs);
+        }
+        AXAgentHIDTouch(x2, y2, 0);
+    });
+    ALog(@"👆 hidswipe(%.0f,%.0f -> %.0f,%.0f %.2fs) 已派发", x1, y1, x2, y2, dur);
+    return YES;
+}
+
+static BOOL AXAgentHIDLongPress(double x, double y, double dur) {
+    if (AXHIDTouchInit() != 1) return NO;
+    g_totalActionCount++;
+    if (dur < 0.2) dur = 0.8;
+    if (dur > 5.0) dur = 5.0;
+    dispatch_async(AXHIDTouchQueue(), ^{
+        AXAgentHIDTouch(x, y, 1);
+        usleep((useconds_t)(dur * 1000000.0));
+        AXAgentHIDTouch(x, y, 0);
+    });
+    ALog(@"👆 hidlongpress(%.0f,%.0f %.2fs) 已派发", x, y, dur);
+    return YES;
+}
+
+extern "C" void AXAgentSetHIDTap(int on) {
+    g_hidTapOn = on ? 1 : 0;
+    if (g_hidTapOn) AXHIDTouchInit();
+    ALog(@"👆 HID 触摸通道 = %s", g_hidTapOn ? "开（IOKit 硬件级直发）" : "关（XCTest 合成）");
+}
+
+extern "C" int AXAgentGetHIDTap(void) { return g_hidTapOn; }
+
+/* ★★ 2026-11-02 HOME 四条通路的实测探针（只探测，不改主路径）。
+   背景：`pressButton:` 每次 5.5 秒（XPC 到 daemon + 空闲等待）。从框架符号表挖到两条**硬件级**通路，
+   都不经过 UI 元素操作：
+     A. XCUIButtonConsole: -[XCUIButtonConsole initWithScreen:] + _silentlyPressButton:forDuration:
+     B. XCDeviceEvent:     +[XCDeviceEvent deviceEventWithPage:usage:duration:] +
+                           -[XCTRunnerDaemonSession performDeviceEvent:completion:]
+   B 里的 page/usage 是 HID 用法码：page 0x0C(Consumer) + usage 0x223(AC Home) 或 0x40(Menu)。
+   用 {"cmd":"hometest","mode":0..4} 逐条试，日志里带耗时，看哪条能秒回。 */
+static volatile long long g_evtCfmMs  = -1;
+static volatile int       g_evtCfmErr = -1;
+
+extern "C" long long AXAgentHomeTest(int mode) {
+    if (!gReady) { ALog(@"❌ hometest: 会话未就绪"); return -1; }
+    long long t0 = AXSeqMs();
+    @try {
+        if (mode == 0) {                                  /* 对照：现在的 pressButton */
+            Class scrCls = NSClassFromString(@"XCUIScreen");
+            id screen = ((id (*)(id, SEL))objc_msgSend)(scrCls, NSSelectorFromString(@"mainScreen"));
+            id dev = ((id (*)(id, SEL))objc_msgSend)(screen, NSSelectorFromString(@"device"));
+            ((void (*)(id, SEL, long))objc_msgSend)(dev, NSSelectorFromString(@"pressButton:"), 1);
+            ALog(@"🧪 hometest[0 pressButton] %lldms", AXSeqMs() - t0);
+        } else if (mode == 1) {                            /* 对照：_silentPressButton */
+            Class scrCls = NSClassFromString(@"XCUIScreen");
+            id screen = ((id (*)(id, SEL))objc_msgSend)(scrCls, NSSelectorFromString(@"mainScreen"));
+            id dev = ((id (*)(id, SEL))objc_msgSend)(screen, NSSelectorFromString(@"device"));
+            ((void (*)(id, SEL, long))objc_msgSend)(dev, NSSelectorFromString(@"_silentPressButton:"), 1);
+            ALog(@"🧪 hometest[1 _silentPressButton] %lldms", AXSeqMs() - t0);
+        } else if (mode == 2) {                            /* A. XCUIButtonConsole 静默按键 */
+            Class ccCls = NSClassFromString(@"XCUIButtonConsole");
+            Class scrCls = NSClassFromString(@"XCUIScreen");
+            id screen = ((id (*)(id, SEL))objc_msgSend)(scrCls, NSSelectorFromString(@"mainScreen"));
+            SEL ini = NSSelectorFromString(@"initWithScreen:");
+            id console = ((id (*)(id, SEL, id))objc_msgSend)([ccCls alloc], ini, screen);
+            SEL sp = NSSelectorFromString(@"_silentlyPressButton:forDuration:");
+            if (![console respondsToSelector:sp]) { ALog(@"🧪 hometest[2] 无 _silentlyPressButton:forDuration:"); return -1; }
+            ((void (*)(id, SEL, long, double))objc_msgSend)(console, sp, 1, 0.05);
+            ALog(@"🧪 hometest[2 XCUIButtonConsole 静默] %lldms", AXSeqMs() - t0);
+        } else if (mode >= 5) {                            /* C. 纯 HID 直发（b89） */
+            long usage = (mode == 6) ? 0x223 : 0x40;        /* Menu / AC Home */
+            BOOL ok = AXAgentHomeHID(usage);
+            ALog(@"🧪 hometest[%d HID直发 usage=0x%lx] %s 总耗时 %lldms",
+                 mode, usage, ok ? "已发" : "不可用", AXSeqMs() - t0);
+        } else {                                           /* B. 硬件设备事件 */
+            long page = 12;                                 /* kHIDPage_Consumer */
+            long usage = (mode == 3) ? 0x223 : 0x40;        /* AC Home / Menu */
+            Class deCls = NSClassFromString(@"XCDeviceEvent");
+            SEL mk = NSSelectorFromString(@"deviceEventWithPage:usage:duration:");
+            if (![deCls respondsToSelector:mk]) { ALog(@"🧪 hometest[%d] 无 deviceEventWithPage:usage:duration:", mode); return -1; }
+            id ev = ((id (*)(id, SEL, long, long, double))objc_msgSend)(deCls, mk, page, usage, 0.05);
+            SEL pd = NSSelectorFromString(@"performDeviceEvent:completion:");
+            if (![gSession respondsToSelector:pd]) { ALog(@"🧪 hometest[%d] 会话无 performDeviceEvent:completion:", mode); return -1; }
+            g_evtCfmMs = -1; g_evtCfmErr = -1;
+            long long sub = AXSeqMs();
+            ((void (*)(id, SEL, id, id))objc_msgSend)(gSession, pd, ev, ^(id err) {
+                g_evtCfmMs = AXSeqMs() - sub;
+                g_evtCfmErr = err ? 1 : 0;
+            });
+            ALog(@"🧪 hometest[%d deviceEvent page=%ld usage=0x%lx] 提交 %lldms", mode, page, usage, AXSeqMs() - t0);
+            usleep(200 * 1000);   /* 等 200ms 看回包，探针专用 */
+            ALog(@"🧪 hometest[%d] 回调 %lldms err=%d", mode, g_evtCfmMs, g_evtCfmErr);
+        }
+    } @catch (NSException *e) {
+        ALog(@"🧪 hometest[%d] 异常：%@", mode, e.reason);
+        return -1;
+    }
+    return AXSeqMs() - t0;
+}
+
+/* ★ 2026-11-02：HOME 之后把会话目标切到 SpringBoard（桌面）。
+   现象：按 HOME 后立刻点一个坐标，**手机屏幕本身**要等几秒才有反应。
+   原因：我们的自动化会话是 requestAutomationSessionForTestTargetWithPID:(getpid()) 起的，
+   目标一直挂在 hbVideo 上；回到桌面后前台变成 com.apple.springboard，
+   第一笔事件要等 XCTest 重新认目标（默认约 5 秒）。
+   WDA 的 fb_goToHomescreenWithError: 之后会 fb_waitUntilRunning 一下 SpringBoard，
+   我们照做：异步 activate 一次，慢也慢在后台线程，不挡用户操作。 */
+static void AXWarmSpringboard(void) {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @try {
+            Class appCls = NSClassFromString(@"XCUIApplication");
+            if (!appCls) return;
+            SEL ini = NSSelectorFromString(@"initWithBundleIdentifier:");
+            if (![appCls instancesRespondToSelector:ini]) return;
+            /* ★ b95：HOME 之后前台就是 SpringBoard。这里**不调 activate**（那会真的切 App、
+               还可能拖长），只读一次 state —— 读 state 就会让 daemon 为这个 App 建立
+               automation session，把"第一笔事件要等 3~5 秒认目标"的成本挪到后台。 */
+            NSString *bid = AXFrontBundleID();
+            if (!bid.length) bid = @"com.apple.springboard";
+            id app = ((id (*)(id, SEL, id))objc_msgSend)([appCls alloc], ini, bid);
+            if (!app) return;
+            long long t0 = AXSeqMs();
+            SEL stSel = NSSelectorFromString(@"state");
+            long st = [app respondsToSelector:stSel]
+                ? ((long (*)(id, SEL))objc_msgSend)(app, stSel) : -1;
+            ALog(@"🏠 SpringBoard 预热完成 bid=%@ state=%ld（%lldms）", bid, st, AXSeqMs() - t0);
+        } @catch (NSException *e) {
+            ALog(@"⚠️ SpringBoard 预热失败：%@", e.reason);
+        }
+    });
+}
+
+extern "C" BOOL AXAgentPressHome(void) {
+    if (!gReady) { ALog(@"❌ pressHome: 会话未就绪"); return NO; }
+
+    /* ★★★ 2026-11-02 b89：第一优先 = 纯 HID 直发（page 0x0C / usage 0x40 Menu）。
+       这条不经过 XCTest，没有确认、没有目标切换、没有 quiescence，发完即回桌面。
+       ★ 但 dispatch 失败是**静默**的（无返回值），没法从代码判断成不成，
+       所以这里**不独占**：HID 发完继续把会话版也发一次，用它兜住"HID 没权限"的情况。
+       两次 HOME 连发没有副作用（已经在桌面时再按一次还是桌面）。 */
+    BOOL hidSent = AXAgentHomeHID(0x40);
+
+    /* ★★★ b96/b97：HOME 之后**主动打一笔 dummy 点击**，把"认目标"的 5 秒在后台吃掉。
+       用户按 HOME 之后要看一下桌面才去点图标，这几秒本来就闲着 —— 让 daemon 在这段时间里
+       把"目标从后台的 hbVideo 换成 SpringBoard"这件事做完，真正点击时就不用等。
+       落点 (2,2) 是状态栏最左边，没有可点元素，副作用仅仅是可能滚回顶部。
+       ★ 另一条 AXWarmSpringboard（读 XCUIApplication.state）也保留，先建会话再打点。 */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(250 * NSEC_PER_MSEC)),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        AXWarmSpringboard();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(150 * NSEC_PER_MSEC)),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            long long t0 = AXSeqMs();
+            AXTapCore(2.0, 2.0);          /* dummy：不吃用户操作，只用来把目标认好 */
+            ALog(@"🏠 dummy 预热完成（%lldms）", AXSeqMs() - t0);
+        });
+    });
+
+    /* ★★★ 2026-11-02 定案：HOME 走**硬件设备事件**，实测提交 0~1ms、用户已确认能回桌面。
+       为什么不用 pressButton:：那条走 XPC + 空闲等待，实测每次 5.3~5.5 秒
+       （pressButton / _silentPressButton / XCUIButtonConsole 三条都一样慢，b84 探针实测数据）。
+       设备事件这条路是直接用 HID 用法码构造「硬件按键」：
+         +[XCDeviceEvent deviceEventWithPage:usage:duration:]  (page=12 Consumer, usage=0x40 Menu)
+         → 首选 -[XCTRunnerDaemonSession performDeviceEvent:completion:]（发送即返回，不堵控制线程）
+         → 退 -[XCUIDevice performDeviceEvent:error:]（WDA 的写法，但**同步阻塞 5.5 秒**，实测堵死控制线程）
+       用法码来自 b84 实测：0x40(Menu) 有效、0x223(AC Home) 无效。 */
+    {
+        Class deCls = NSClassFromString(@"XCDeviceEvent");
+        SEL mk = NSSelectorFromString(@"deviceEventWithPage:usage:duration:");
+        if (deCls && [deCls respondsToSelector:mk]) {
+            @try {
+                long long t0 = AXSeqMs();
+                id ev = ((id (*)(id, SEL, long, long, double))objc_msgSend)(deCls, mk, 12, 0x40, 0.05);
+                if (ev) {
+                    /* ★☆ 先走**发送即返回**的会话版，再退同步版。
+                       实测（b87 日志）：`-[XCUIDevice performDeviceEvent:error:]` 是**同步阻塞**的，
+                       每次 5.5 秒 —— 它把我们的控制线程堵死，这 5.5 秒里 socket 都读不了，
+                       用户按完 HOME 紧接着的那一下点击只能躺在 TCP 缓冲里等着 ⇒ 就是「点一下等几秒」。
+                       会话版 completion 永不回调，但**立刻返回**，控制线程不阻塞，下一笔点击马上能处理。
+                       （代价：daemon 那边这笔事件可能要挂一会儿，但实测接着点的那笔确认只要 1ms，不影响。） */
+                    SEL pd = NSSelectorFromString(@"performDeviceEvent:completion:");
+                    if ([gSession respondsToSelector:pd]) {
+                        void (^done)(id) = ^(id e) { /* 不捕获对象 */ };
+                        ((void (*)(id, SEL, id, id))objc_msgSend)(gSession, pd, ev, done);
+                        ALog(@"🏠 home = 会话 performDeviceEvent（%lldms，发送即返回）hid=%d", AXSeqMs() - t0, (int)hidSent);
+                        return YES;
+                    }
+                    /* 退路：同步版（会阻塞 5.5 秒，但不阻塞也比回不了桌面强） */
+                    Class scrCls = NSClassFromString(@"XCUIScreen");
+                    id screen = ((id (*)(id, SEL))objc_msgSend)(scrCls, NSSelectorFromString(@"mainScreen"));
+                    id dev = screen ? ((id (*)(id, SEL))objc_msgSend)(screen, NSSelectorFromString(@"device")) : nil;
+                    SEL pde = NSSelectorFromString(@"performDeviceEvent:error:");
+                    if (dev && [dev respondsToSelector:pde]) {
+                        NSError *err = nil;
+                        ((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(dev, pde, ev, &err);
+                        ALog(@"🏠 home = XCUIDevice performDeviceEvent（%lldms）err=%@",
+                             AXSeqMs() - t0, err ? err.localizedDescription : @"无");
+                        return YES;
+                    }
+                }
+                ALog(@"⚠️ pressHome: deviceEvent 构造失败，回退按键");
+            } @catch (NSException *e) {
+                ALog(@"⚠️ pressHome: deviceEvent 异常 %@，回退按键", e.reason);
+            }
+        }
+    }
+
+    /* ★ b89：HID 已经发出去了，就**不要**再走按键通道 —— 那条每次 5.5 秒，
+       只会白堵控制线程（用户最恨的"按完 HOME 点一下要等几秒"）。
+       只有 HID 连符号都拿不到（hidSent=NO）才用按键兜底。 */
+    /* ★ b90：HID 直发成功后也要把会话目标切到 SpringBoard —— b89 在这里直接 return，
+       漏掉了预热，回到桌面后第一笔点击要重新认目标（日志 4477ms 就是这么来的）。 */
+    if (hidSent) { g_totalActionCount++; ALog(@"🏠 home 已由 HID 直发（累计动作=%d）", g_totalActionCount); if (gSession) AXWarmSpringboard(); return YES; }
+
+    Class scrCls = NSClassFromString(@"XCUIScreen");
+    if (!scrCls) return NO;
+    id screen = ((id (*)(id, SEL))objc_msgSend)(scrCls, NSSelectorFromString(@"mainScreen"));
+    if (!screen) return NO;
+    id dev = ((id (*)(id, SEL))objc_msgSend)(screen, NSSelectorFromString(@"device"));
+    if (!dev) { ALog(@"❌ pressHome: 无 device"); return NO; }
+    SEL pb = NSSelectorFromString(@"pressButton:");
+    if (![dev respondsToSelector:pb]) { ALog(@"❌ pressHome: 无 pressButton:"); return NO; }
+    long long phT0 = AXSeqMs();
+    /* ★★ 2026-11-02 照 AScript 的做法：优先用**静默版** `_silentPressButton:`。
+       普通 pressButton: 会等 App 空闲（quiescence，默认 5 秒），目标 App 一直在动就每次等满，
+       实测日志里相邻两次 pressHome 正好 5.5 秒。静默版不走那套等待。
+       框架符号表里确实有 -[XCUIDevice _silentPressButton:] 与 -[XCUIButtonConsole _silentlyPressButton:forDuration:]。 */
+    SEL spb = NSSelectorFromString(@"_silentPressButton:");
+    static BOOL s_silentLogged = NO;
+    if ([dev respondsToSelector:spb]) {
+        ((void (*)(id, SEL, long))objc_msgSend)(dev, spb, 1);   /* XCUIDeviceButtonHome = 1 */
+        if (!s_silentLogged) { s_silentLogged = YES; ALog(@"🏠 走 _silentPressButton:（不等空闲）"); }
+        ALog(@"🏠 pressHome 已发送（静默版，耗时 %lldms）", AXSeqMs() - phT0);
+        AXWarmSpringboard();
+        return YES;
+    }
+    ((void (*)(id, SEL, long))objc_msgSend)(dev, pb, 1);   /* XCUIDeviceButtonHome = 1 */
+    ALog(@"🏠 pressHome 已发送（普通版，调用耗时 %lldms）", AXSeqMs() - phT0);
+    AXWarmSpringboard();
+    return YES;
+}
+
+static BOOL AXGestureCore(const double *xy, const double *t, int n) {
+    if (!gReady || !gSession) { ALog(@"❌ gesture 失败：会话未就绪"); return NO; }
+    if (n < 2) { ALog(@"❌ gesture 失败：点数不足"); return NO; }
+    @try {
+        Class pathCls = NSClassFromString(@"XCPointerEventPath");
+        Class recCls  = NSClassFromString(@"XCSynthesizedEventRecord");
+        if (!pathCls || !recCls) { ALog(@"❌ gesture: 类不存在"); return NO; }
+
+        SEL initPath = NSSelectorFromString(@"initForTouchAtPoint:offset:");
+        id (*fpInit)(id, SEL, CGPoint, double) = (id (*)(id, SEL, CGPoint, double))objc_msgSend;
+        id path = fpInit([pathCls alloc], initPath, CGPointMake(xy[0], xy[1]), t[0]);
+        if (!path) { ALog(@"❌ gesture: path 构造失败"); return NO; }
+
+        SEL mv = NSSelectorFromString(@"moveToPoint:atOffset:");
+        void (*fpMv)(id, SEL, CGPoint, double) = (void (*)(id, SEL, CGPoint, double))objc_msgSend;
+        SEL up = NSSelectorFromString(@"liftUpAtOffset:");
+        void (*fpUp)(id, SEL, double) = (void (*)(id, SEL, double))objc_msgSend;
+
+        for (int i = 1; i < n - 1; i++) {
+            if ([path respondsToSelector:mv])
+                fpMv(path, mv, CGPointMake(xy[i*2], xy[i*2+1]), t[i]);
+        }
+        if ([path respondsToSelector:up]) fpUp(path, up, t[n-1]);
+
+        long orient = AXInterfaceOrientation();
+        SEL initRec = NSSelectorFromString(@"initWithName:interfaceOrientation:");
+        id (*fpRec)(id, SEL, id, long) = (id (*)(id, SEL, id, long))objc_msgSend;
+        id rec = fpRec([recCls alloc], initRec, @"AXAgent", orient);
+        if (!rec) { ALog(@"❌ gesture: record 构造失败"); return NO; }
+        SEL addPath = NSSelectorFromString(@"addPointerEventPath:");
+        ((void (*)(id, SEL, id))objc_msgSend)(rec, addPath, path);
+
+        SEL syn = NSSelectorFromString(@"synthesizeEvent:completion:");
+        if (![gSession respondsToSelector:syn]) { ALog(@"❌ gesture: 无 synthesizeEvent"); return NO; }
+        void (^completion)(id) = ^(id err) { };
+        ((void (*)(id, SEL, id, id))objc_msgSend)(gSession, syn, rec, completion);
+        ALog(@"  ✅ gesture 已提交（%d 点，末点 %.2fs）", n, t[n-1]);
+        return YES;
+    } @catch (NSException *e) {
+        ALog(@"❌ gesture 异常: %@ / %@", e.name, e.reason);
+        return NO;
+    }
+}
+
+/* 对外的 gesture：给 10010 用，提交后等 0.1 秒 */
+extern "C" BOOL AXAgentGesture(const double *xy, const double *t, int n) {
+    if ((g_hidTapOn != 0 || !gSession) && n >= 2) {
+        double dur = (t[n - 1] > t[0]) ? (t[n - 1] - t[0]) : 0.25;
+        return AXAgentHIDSwipe(xy[0], xy[1], xy[(n - 1) * 2], xy[(n - 1) * 2 + 1], dur);
+    }
+    BOOL ok = AXGestureCore(xy, t, n);
+    if (ok) [NSThread sleepForTimeInterval:0.1];
+    return ok;
+}
+
+extern "C" BOOL AXAgentSwipe(double x1, double y1, double x2, double y2, double dur) {
+    if (dur <= 0) dur = 0.25;
+    if (g_hidTapOn != 0 || !gSession) {
+        return AXAgentHIDSwipe(x1, y1, x2, y2, dur);
+    }
+    double xy[4] = { x1, y1, x2, y2 };
+    double t[2]  = { 0.0, dur };
+    return AXAgentGesture(xy, t, 2);
+}
+
+extern "C" BOOL AXAgentLongPress(double x, double y, double dur) {
+    if (dur <= 0) dur = 1.0;
+    if (g_hidTapOn != 0 || !gSession) {
+        return AXAgentHIDLongPress(x, y, dur);
+    }
+    double xy[4] = { x, y, x, y };
+    double t[2]  = { 0.0, dur };
+    return AXAgentGesture(xy, t, 2);
+}
+
+#pragma mark - 5b. 双指缩放 / 键盘输入 / 剪贴板
+
+/* 统一提交入口。completion 块绝不能捕获任何 ObjC 对象（函数返回后 __block 变量失效，
+   XPC 回调再来会 objc_retain 野指针直接 SIGSEGV —— b35/b36 就是这么崩的）。 */
+static BOOL AXSubmitEventRecord(id rec, double waitSec) {
+    if (!gReady || !gSession || !rec) return NO;
+    SEL syn = NSSelectorFromString(@"synthesizeEvent:completion:");
+    if (![gSession respondsToSelector:syn]) {
+        ALog(@"❌ daemonSession 无 synthesizeEvent:completion:");
+        return NO;
+    }
+    void (^completion)(id) = ^(id err) { };
+    ((void (*)(id, SEL, id, id))objc_msgSend)(gSession, syn, rec, completion);
+    if (waitSec > 0) [NSThread sleepForTimeInterval:waitSec];
+    return YES;
+}
+
+static id AXNewEventRecord(void) {
+    Class recCls = NSClassFromString(@"XCSynthesizedEventRecord");
+    if (!recCls) return nil;
+    SEL initRec = NSSelectorFromString(@"initWithName:interfaceOrientation:");
+    id (*fp)(id, SEL, id, long) = (id (*)(id, SEL, id, long))objc_msgSend;
+    return fp([recCls alloc], initRec, @"AXAgent", AXInterfaceOrientation());
+}
+
+/* 双指缩放：以 (cx,cy) 为中心，两指间距从 startGap 变到 endGap（点）。
+   startGap<endGap = 放大；startGap>endGap = 缩小。
+   实现：同一个 XCSynthesizedEventRecord 里挂两条 XCPointerEventPath，各代表一根手指，
+   同步移动 —— 这是 XCTest 合成多点触控的唯一入口（XCUIElement.pinch 需要有元素，我们没有）。 */
+extern "C" BOOL AXAgentPinch(double cx, double cy, double startGap, double endGap, double dur) {
+    if (!gReady || !gSession) { ALog(@"❌ pinch 失败：会话未就绪"); return NO; }
+    if (startGap <= 0) startGap = 200;
+    if (endGap   <= 0) endGap   = 200;
+    if (dur      <= 0) dur      = 0.35;
+    @try {
+        Class pathCls = NSClassFromString(@"XCPointerEventPath");
+        id rec = AXNewEventRecord();
+        if (!pathCls || !rec) { ALog(@"❌ pinch: 类/record 构造失败"); return NO; }
+
+        SEL initPath = NSSelectorFromString(@"initForTouchAtPoint:offset:");
+        SEL mv       = NSSelectorFromString(@"moveToPoint:atOffset:");
+        SEL up       = NSSelectorFromString(@"liftUpAtOffset:");
+        SEL addPath  = NSSelectorFromString(@"addPointerEventPath:");
+
+        for (int side = -1; side <= 1; side += 2) {
+            CGPoint p0 = CGPointMake(cx + side * startGap / 2.0, cy);
+            CGPoint p1 = CGPointMake(cx + side * endGap   / 2.0, cy);
+            id path = ((id (*)(id, SEL, CGPoint, double))objc_msgSend)(
+                          [pathCls alloc], initPath, p0, 0.0);
+            if (!path) { ALog(@"❌ pinch: path 构造失败"); return NO; }
+            ((void (*)(id, SEL, CGPoint, double))objc_msgSend)(path, mv, p1, dur);
+            ((void (*)(id, SEL, double))objc_msgSend)(path, up, dur);
+            ((void (*)(id, SEL, id))objc_msgSend)(rec, addPath, path);
+        }
+
+        BOOL ok = AXSubmitEventRecord(rec, dur + 0.15);
+        ALog(@"  ✅ pinch(%.0f,%.0f) %.0f→%.0f ok=%d", cx, cy, startGap, endGap, ok);
+        return ok;
+    } @catch (NSException *e) {
+        ALog(@"❌ pinch 异常: %@ / %@", e.name, e.reason);
+        return NO;
+    }
+}
+
+/* 文本输入：XCPointerEventPath initForTextInput + typeText:atOffset:typingSpeed:shouldRedact:
+   （反汇编确认签名 v44@0:8@16d24Q32B40）
+   ★ ASCII 稳；CJK 建议走 paste（HID 注入对非键盘字符不可靠）。 */
+extern "C" BOOL AXAgentTypeText(NSString *text) {
+    if (!gReady || !gSession) { ALog(@"❌ text 失败：会话未就绪"); return NO; }
+    if (text.length == 0) return NO;
+    @try {
+        Class pathCls = NSClassFromString(@"XCPointerEventPath");
+        id rec = AXNewEventRecord();
+        if (!pathCls || !rec) { ALog(@"❌ text: 类/record 构造失败"); return NO; }
+
+        id path = ((id (*)(id, SEL))objc_msgSend)([pathCls alloc],
+                                                  NSSelectorFromString(@"initForTextInput"));
+        if (!path) { ALog(@"❌ text: initForTextInput 返回 nil"); return NO; }
+
+        SEL tt = NSSelectorFromString(@"typeText:atOffset:typingSpeed:shouldRedact:");
+        if (![path respondsToSelector:tt]) { ALog(@"❌ text: 无 typeText: 方法"); return NO; }
+        ((void (*)(id, SEL, id, double, unsigned long, BOOL))objc_msgSend)(
+            path, tt, text, 0.0, (unsigned long)0, NO);
+
+        ((void (*)(id, SEL, id))objc_msgSend)(rec,
+            NSSelectorFromString(@"addPointerEventPath:"), path);
+
+        BOOL ok = AXSubmitEventRecord(rec, 0.15 + MIN(2.0, text.length * 0.02));
+        ALog(@"  ⌨️ 文本输入 %lu 字 ok=%d", (unsigned long)text.length, ok);
+        return ok;
+    } @catch (NSException *e) {
+        ALog(@"❌ text 异常: %@ / %@", e.name, e.reason);
+        return NO;
+    }
+}
+
+/* 单键 / 组合键：typeKey:modifiers:atOffset:（签名 v40@0:8@16Q24d32）
+   key 传字符串（如 "v"、@"\r" 回车）；mods 用 UIKeyModifierFlags：
+     Shift=1<<17  Control=1<<18  Option=1<<19  Cmd=1<<20 */
+extern "C" BOOL AXAgentKey(NSString *key, unsigned long mods) {
+    if (!gReady || !gSession) { ALog(@"❌ key 失败：会话未就绪"); return NO; }
+    if (key.length == 0) return NO;
+    @try {
+        Class pathCls = NSClassFromString(@"XCPointerEventPath");
+        id rec = AXNewEventRecord();
+        if (!pathCls || !rec) return NO;
+
+        id path = ((id (*)(id, SEL))objc_msgSend)([pathCls alloc],
+                                                  NSSelectorFromString(@"initForTextInput"));
+        if (!path) return NO;
+
+        SEL tk = NSSelectorFromString(@"typeKey:modifiers:atOffset:");
+        if (![path respondsToSelector:tk]) { ALog(@"❌ key: 无 typeKey: 方法"); return NO; }
+        ((void (*)(id, SEL, id, unsigned long, double))objc_msgSend)(path, tk, key, mods, 0.0);
+
+        ((void (*)(id, SEL, id))objc_msgSend)(rec,
+            NSSelectorFromString(@"addPointerEventPath:"), path);
+
+        BOOL ok = AXSubmitEventRecord(rec, 0.2);
+        ALog(@"  ⌨️ 按键 %@ mods=0x%lx ok=%d", key, mods, ok);
+        return ok;
+    } @catch (NSException *e) {
+        ALog(@"❌ key 异常: %@ / %@", e.name, e.reason);
+        return NO;
+    }
+}
+
+/* 粘贴：把文本写进系统剪贴板，再发 Cmd+V。
+   CJK 只能走这条（HID 逐键打不出中文）。
+   ★ iOS 16+ 目标 App 首次读剪贴板会弹「允许粘贴」，不点允许就粘不上 —— 系统行为，绕不过。 */
+extern "C" BOOL AXAgentPaste(NSString *text) {
+    if (text) [UIPasteboard generalPasteboard].string = text;
+    BOOL ok = AXAgentKey(@"v", (1UL << 20));
+    ALog(@"  📋 粘贴 %lu 字（已写剪贴板 + Cmd+V）ok=%d", (unsigned long)text.length, ok);
+    return ok;
+}
+
+/* 读系统剪贴板（手机 → PC 的"复制"） */
+extern "C" NSString *AXAgentPasteboardGet(void) {
+    NSString *v = [UIPasteboard generalPasteboard].string ?: @"";
+    return v;
+}
+
+/* 只写剪贴板，不发按键（PC 端要自己控制粘贴时机时用） */
+extern "C" BOOL AXAgentPasteboardSet(NSString *text) {
+    if (!text) return NO;
+    [UIPasteboard generalPasteboard].string = text;
+    return YES;
+}
+
+#pragma mark - 5c. 流式触控实验（分段提交 vs 整段提交）
+
+/* 把一次拖动切成若干段分别 synthesizeEvent，用来验证 XCTest 是否支持
+   「跨 record 保持手指按下」：
+     mode 0 = 整段一条 record 一次提交（现在的正式做法，作为对照）
+     mode 1 = 分段提交：首段 beginsPersistentState、末段 endsPersistentState，
+              中间每段从上一位置 move 到新位置
+   两次都从 (x1,y1) 拖到 (x2,y2)，steps 段，段间停顿 gapMs。
+   返回一段摘要（每段耗时），同时打日志 —— 判断依据就看"手指有没有真的跟着走"。 */
+/* 把一次拖动切成若干段分别 synthesizeEvent，用来验证 XCTest 是否支持
+   「跨 record 保持手指按下」：
+     mode 0 = 整段一条 record 一次提交（现在的正式做法，作为对照）
+     mode 1 = 分段提交：首段 beginsPersistentState、末段 endsPersistentState，
+              中间每段从上一位置 move 到新位置
+   两次都从 (x1,y1) 拖到 (x2,y2)，steps 段，段间停顿 gapMs。
+   返回值带每段耗时 —— 判断依据就看"手指有没有真的跟着走"。 */
+extern "C" NSString *AXAgentTouchSeq(int mode, double x1, double y1, double x2, double y2,
+                                     int steps, int gapMs) {
+    if (!gReady || !gSession) return @"not ready";
+    if (steps < 2)  steps = 10;
+    if (steps > 60) steps = 60;
+    if (gapMs < 0)  gapMs = 0;
+
+    Class pathCls = NSClassFromString(@"XCPointerEventPath");
+    Class recCls  = NSClassFromString(@"XCSynthesizedEventRecord");
+    if (!pathCls || !recCls) return @"no class";
+
+    SEL initPath = NSSelectorFromString(@"initForTouchAtPoint:offset:");
+    SEL mv       = NSSelectorFromString(@"moveToPoint:atOffset:");
+    SEL up       = NSSelectorFromString(@"liftUpAtOffset:");
+    SEL addPath  = NSSelectorFromString(@"addPointerEventPath:");
+    SEL initRec  = NSSelectorFromString(@"initWithName:interfaceOrientation:");
+
+    long long t0 = AXSeqMs();
+
+    if (mode == 0) {
+        double dur = steps * 0.02;
+        id rec = ((id (*)(id, SEL, id, long))objc_msgSend)([recCls alloc], initRec,
+                                                           @"AXSeqWhole", AXInterfaceOrientation());
+        if (!rec) return @"no record";
+        id path = ((id (*)(id, SEL, CGPoint, double))objc_msgSend)(
+                      [pathCls alloc], initPath, CGPointMake(x1, y1), 0.0);
+        if (!path) return @"no path";
+        for (int i = 1; i <= steps; i++) {
+            double k = (double)i / (double)steps;
+            ((void (*)(id, SEL, CGPoint, double))objc_msgSend)(path, mv,
+                CGPointMake(x1 + (x2 - x1) * k, y1 + (y2 - y1) * k), dur * k);
+        }
+        ((void (*)(id, SEL, double))objc_msgSend)(path, up, dur);
+        ((void (*)(id, SEL, id))objc_msgSend)(rec, addPath, path);
+        BOOL ok = AXSubmitEventRecord(rec, dur + 0.1);
+        long long el = AXSeqMs() - t0;
+        ALog(@"🧪 [seq] mode=0 整段提交 steps=%d ok=%d %lldms", steps, ok, el);
+        return [NSString stringWithFormat:@"mode=0 ok=%d %lldms", ok, el];
+    }
+
+    /* mode 1：分段 + persistent state */
+    NSMutableString *spent = [NSMutableString string];
+    double px = x1, py = y1;
+    BOOL anyFail = NO;
+
+    for (int i = 0; i <= steps && !anyFail; i++) {
+        @autoreleasepool {
+            double k = (double)i / (double)steps;
+            CGPoint p = CGPointMake(x1 + (x2 - x1) * k, y1 + (y2 - y1) * k);
+            BOOL first = (i == 0);
+            BOOL last  = (i == steps);
+
+            id rec = ((id (*)(id, SEL, id, long))objc_msgSend)([recCls alloc], initRec,
+                                                               @"AXSeqSeg", AXInterfaceOrientation());
+            if (!rec) {
+                anyFail = YES;
+            } else {
+                /* KVC：类上确实有 setBeginsPersistentState: / setEndsPersistentState: */
+                if (first) [rec setValue:@YES forKey:@"beginsPersistentState"];
+                if (last)  [rec setValue:@YES forKey:@"endsPersistentState"];
+
+                id path = ((id (*)(id, SEL, CGPoint, double))objc_msgSend)(
+                              [pathCls alloc], initPath, CGPointMake(px, py), 0.0);
+                if (!path) {
+                    anyFail = YES;
+                } else {
+                    if (!first) {
+                        ((void (*)(id, SEL, CGPoint, double))objc_msgSend)(path, mv, p, 0.0);
+                    }
+                    if (last) {
+                        ((void (*)(id, SEL, double))objc_msgSend)(path, up, 0.0);
+                    }
+                    ((void (*)(id, SEL, id))objc_msgSend)(rec, addPath, path);
+
+                    long long s0 = AXSeqMs();
+                    if (!AXSubmitEventRecord(rec, 0)) anyFail = YES;
+                    [spent appendFormat:@"%lld,", AXSeqMs() - s0];
+                }
+            }
+            px = p.x; py = p.y;
+            if (gapMs > 0) usleep((useconds_t)(gapMs * 1000));
+        }
+    }
+
+    long long el = AXSeqMs() - t0;
+    ALog(@"🧪 [seq] mode=1 分段提交 %d 段 gap=%dms fail=%d 总%lldms 每段[%@]",
+         steps + 1, gapMs, anyFail, el, spent);
+    return [NSString stringWithFormat:@"mode=1 segs=%d fail=%d %lldms [%@]",
+            steps + 1, anyFail, el, spent];
+}
+
+#pragma mark - 6. 截图（JPEG + 缩放，返回 base64）
+
+static BOOL gShotProbed = NO;
+static CVPixelBufferRef g_lastFramePB = NULL;
+static pthread_mutex_t  g_lastFrameMu = PTHREAD_MUTEX_INITIALIZER;
+static volatile long long g_lastFrameAtMs = 0;
+
+static void AXCacheFramePB(CVPixelBufferRef pb) {
+    if (!pb) return;
+    pthread_mutex_lock(&g_lastFrameMu);
+    if (g_lastFramePB) CVPixelBufferRelease(g_lastFramePB);
+    g_lastFramePB = CVPixelBufferRetain(pb);
+    pthread_mutex_unlock(&g_lastFrameMu);
+}
+
+static UIImage *AXImageFromLastFramePB(void) {
+    CVPixelBufferRef pb = NULL;
+    pthread_mutex_lock(&g_lastFrameMu);
+    if (g_lastFramePB) pb = CVPixelBufferRetain(g_lastFramePB);
+    pthread_mutex_unlock(&g_lastFrameMu);
+    if (!pb) return nil;
+    UIImage *res = nil;
+    @autoreleasepool {
+        CIImage *ci = [CIImage imageWithCVPixelBuffer:pb];
+        if (ci) {
+            static CIContext *s_ctx = nil;
+            static dispatch_once_t once;
+            dispatch_once(&once, ^{ s_ctx = [CIContext contextWithOptions:nil]; });
+            CGImageRef cg = [s_ctx createCGImage:ci fromRect:ci.extent];
+            if (cg) {
+                res = [UIImage imageWithCGImage:cg];
+                CGImageRelease(cg);
+            }
+        }
+    }
+    CVPixelBufferRelease(pb);
+    return res;
+}
+
+static UIImage *AXGrabFallbackUIImage(void) {
+    /* 1. 先取 ReplayKit 缓存的最新帧 */
+    UIImage *rkImg = AXImageFromLastFramePB();
+    if (rkImg) return rkImg;
+
+    /* 2. 尝试系统私有全屏截图 _UICreateScreenUIImage */
+    typedef UIImage *(*UICreateScreenImgFn)(void);
+    static UICreateScreenImgFn fScreenImg = NULL;
+    static BOOL s_looked = NO;
+    if (!s_looked) {
+        s_looked = YES;
+        fScreenImg = (UICreateScreenImgFn)dlsym(RTLD_DEFAULT, "_UICreateScreenUIImage");
+    }
+    if (fScreenImg) {
+        @try {
+            UIImage *simg = fScreenImg();
+            if (simg && simg.size.width > 10) return simg;
+        } @catch (NSException *e) {}
+    }
+
+    /* 3. 截取本应用当前窗口画面兜底 */
+    __block UIImage *winImg = nil;
+    void (^grabWin)(void) = ^{
+        UIWindow *targetWin = nil;
+        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
+            if (![s isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in ((UIWindowScene *)s).windows) {
+                if (w.isKeyWindow || !targetWin) targetWin = w;
+            }
+        }
+        if (targetWin && targetWin.bounds.size.width > 10) {
+            UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
+            fmt.scale = 2.0;
+            fmt.opaque = YES;
+            UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:targetWin.bounds.size format:fmt];
+            winImg = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+                [targetWin drawViewHierarchyInRect:targetWin.bounds afterScreenUpdates:NO];
+            }];
+        }
+    };
+    if ([NSThread isMainThread]) grabWin();
+    else dispatch_sync(dispatch_get_main_queue(), grabWin);
+    return winImg;
+}
+
+static NSString *AXEncodeUIImageBase64(UIImage *ui, double maxSide, double quality) {
+    if (!ui) return nil;
+    CGSize sz = ui.size;
+    CGFloat sc = ui.scale > 1.0 ? ui.scale : 1.0;
+    CGFloat pw = sz.width * sc, ph = sz.height * sc;
+    CGFloat longSide = MAX(pw, ph);
+    CGSize ns = CGSizeMake(pw, ph);
+    if (maxSide > 0 && longSide > maxSide) {
+        CGFloat k = maxSide / longSide;
+        ns = CGSizeMake(round(pw * k), round(ph * k));
+    }
+    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
+    fmt.scale = 1.0;
+    fmt.opaque = YES;
+    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:ns format:fmt];
+    UIImage *out = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        [ui drawInRect:CGRectMake(0, 0, ns.width, ns.height)];
+    }];
+    if (quality <= 0) quality = 0.65;
+    NSData *jpeg = UIImageJPEGRepresentation(out, quality);
+    if (!jpeg) return nil;
+    return [jpeg base64EncodedStringWithOptions:0];
+}
+
+extern "C" NSString *AXAgentShot(double maxSide, double quality) {
+    @autoreleasepool {
+        UIImage *fb = AXGrabFallbackUIImage();
+        if (fb) {
+            NSString *b64 = AXEncodeUIImageBase64(fb, maxSide, quality);
+            if (b64.length > 0) return b64;
+        }
+    }
+    if (!gReady) { ALog(@"❌ shot 失败：会话未就绪"); return nil; }
+    @autoreleasepool {
+        Class scrCls = NSClassFromString(@"XCUIScreen");
+        if (!scrCls) { ALog(@"❌ shot: XCUIScreen 不存在（DDI 未挂载？）"); return nil; }
+
+        id screen = nil;
+        SEL ms = NSSelectorFromString(@"mainScreen");
+        if ([scrCls respondsToSelector:ms]) screen = ((id (*)(id, SEL))objc_msgSend)(scrCls, ms);
+        if (!screen) { ALog(@"❌ shot: mainScreen 为 nil"); return nil; }
+
+        SEL ss = NSSelectorFromString(@"screenshot");
+        if (![screen respondsToSelector:ss]) { ALog(@"❌ shot: 无 screenshot 方法"); return nil; }
+
+        /* ===== 段1：截图请求（XCUIScreen → XCUIScreenshot 对象） ===== */
+        CFTimeInterval t0 = CACurrentMediaTime();
+        id shot = ((id (*)(id, SEL))objc_msgSend)(screen, ss);
+        CFTimeInterval t1 = CACurrentMediaTime();
+        if (!shot) { ALog(@"❌ shot: screenshot 返回 nil"); return nil; }
+
+        /* 首次调用：把 shot 对象的家底摊开，并单独计时几个可能更快的取图方式 */
+        if (!gShotProbed) {
+            gShotProbed = YES;
+            ALog(@"  🔍 [shot 探测] screenshot 返回类 = %@", NSStringFromClass([shot class]));
+            AXDumpClass(NSStringFromClass([shot class]));
+
+            SEL sp = NSSelectorFromString(@"pngRepresentation");
+            if ([shot respondsToSelector:sp]) {
+                CFTimeInterval p0 = CACurrentMediaTime();
+                id png = ((id (*)(id, SEL))objc_msgSend)(shot, sp);
+                CFTimeInterval p1 = CACurrentMediaTime();
+                NSUInteger n = [png isKindOfClass:[NSData class]] ? [(NSData *)png length] : 0;
+                ALog(@"  🔍 [shot 探测] pngRepresentation → %@  %.1fKB  %.0fms",
+                     png ? NSStringFromClass([png class]) : @"nil",
+                     n / 1024.0, (p1 - p0) * 1000.0);
+            } else {
+                ALog(@"  🔍 [shot 探测] 无 pngRepresentation");
+            }
+
+            SEL cg = NSSelectorFromString(@"CGImage");
+            if ([shot respondsToSelector:cg]) {
+                CFTimeInterval p0 = CACurrentMediaTime();
+                id g = ((id (*)(id, SEL))objc_msgSend)(shot, cg);
+                CFTimeInterval p1 = CACurrentMediaTime();
+                ALog(@"  🔍 [shot 探测] CGImage → %@  %.0fms", g ? @"ok" : @"nil", (p1 - p0) * 1000.0);
+            } else {
+                ALog(@"  🔍 [shot 探测] 无 CGImage");
+            }
+        }
+
+        /* ===== 段2：解成 UIImage ===== */
+        CFTimeInterval t2a = CACurrentMediaTime();
+        SEL im = NSSelectorFromString(@"image");
+        id img = [shot respondsToSelector:im] ? ((id (*)(id, SEL))objc_msgSend)(shot, im) : nil;
+        CFTimeInterval t2b = CACurrentMediaTime();
+        if (!img) { ALog(@"❌ shot: image 为 nil"); return nil; }
+
+        /* ===== 段3：缩放 ===== */
+        UIImage *ui = (UIImage *)img;
+        CGSize sz = ui.size;
+        CGFloat longSide = MAX(sz.width, sz.height);
+        UIImage *out = ui;
+        CFTimeInterval t3a = CACurrentMediaTime();
+        if (maxSide > 0 && longSide > maxSide) {
+            CGFloat k = maxSide / longSide;
+            CGSize ns = CGSizeMake(round(sz.width * k), round(sz.height * k));
+            UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
+            fmt.scale = 1.0;            // 关键：否则按屏幕 3 倍渲染，像素数 ×9、编码变慢 5 倍
+            fmt.opaque = YES;
+            UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:ns format:fmt];
+            out = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+                [ui drawInRect:CGRectMake(0, 0, ns.width, ns.height)];
+            }];
+        }
+        CFTimeInterval t3b = CACurrentMediaTime();
+
+        /* ===== 段4：JPEG 编码 ===== */
+        if (quality <= 0) quality = 0.6;
+        NSData *jpeg = UIImageJPEGRepresentation(out, quality);
+        CFTimeInterval t4 = CACurrentMediaTime();
+        if (!jpeg) { ALog(@"❌ shot: JPEG 编码失败"); return nil; }
+
+        ALog(@"  📷 shot %.0fx%.0f -> %.0fx%.0f %luKB | 请求%.0f 解码%.0f 缩放%.0f 编码%.0f ms",
+             sz.width, sz.height, out.size.width, out.size.height,
+             (unsigned long)(jpeg.length / 1024),
+             (t1 - t0) * 1000.0, (t2b - t2a) * 1000.0,
+             (t3b - t3a) * 1000.0, (t4 - t3b) * 1000.0);
+        return [jpeg base64EncodedStringWithOptions:0];
+    }
+}
+
+
+#pragma mark - 7. 录屏流探针（runtime dump + 试调私有 API）
+
+static void AXDumpClass(NSString *name) {
+    Class cls = NSClassFromString(name);
+    if (!cls) { ALog(@"  [dump] %@ → 不存在", name); return; }
+    ALog(@"  [dump] %@", name);
+
+    unsigned int n = 0;
+    Method *ms = class_copyMethodList(cls, &n);
+    NSMutableString *sb = [NSMutableString string];
+    for (unsigned i = 0; i < n; i++) {
+        [sb appendFormat:@"%@ |", NSStringFromSelector(method_getName(ms[i]))];
+        if (sb.length > 900) break;
+    }
+    free(ms);
+    ALog(@"     方法(%u): %@", n, sb.length ? sb : @"(无)");
+
+    /* ★ b44：类方法（metaclass）单独 dump —— sharedClient 这类工厂方法全在这里，
+       只看实例方法会误判"类里没有 sharedClient" */
+    Class meta = object_getClass(cls);
+    unsigned int mn = 0;
+    Method *mms = class_copyMethodList(meta, &mn);
+    NSMutableString *sm = [NSMutableString string];
+    for (unsigned i = 0; i < mn; i++) {
+        [sm appendFormat:@"+%@ |", NSStringFromSelector(method_getName(mms[i]))];
+        if (sm.length > 700) break;
+    }
+    free(mms);
+    ALog(@"     类方法(%u): %@", mn, sm.length ? sm : @"(无)");
+
+    unsigned int ivn = 0;
+    Ivar *iv = class_copyIvarList(cls, &ivn);
+    NSMutableString *s2 = [NSMutableString string];
+    for (unsigned i = 0; i < ivn; i++) {
+        const char *nm = ivar_getName(iv[i]);
+        const char *tp = ivar_getTypeEncoding(iv[i]);
+        [s2 appendFormat:@"%s(%s) |", nm ? nm : "?", tp ? tp : "?"];
+        if (s2.length > 600) break;
+    }
+    free(iv);
+    ALog(@"     成员(%u): %@", ivn, s2.length ? s2 : @"(无)");
+}
+
+extern "C" NSString *AXAgentProbeRecording(void) {
+    ALog(@"===== 录屏流探针开始 =====");
+    if (!gReady || !gSession) { ALog(@"❌ 会话未就绪"); return @"not ready"; }
+
+    SEL sSupp = NSSelectorFromString(@"supportsScreenRecording");
+    SEL sActive = NSSelectorFromString(@"isScreenRecordingActive");
+    SEL sPref = NSSelectorFromString(@"preferScreenshotsOverScreenRecording");
+    ALog(@"会话 respondsToSelector:");
+    ALog(@"   supportsScreenRecording            = %d", (int)[gSession respondsToSelector:sSupp]);
+    ALog(@"   isScreenRecordingActive            = %d", (int)[gSession respondsToSelector:sActive]);
+    ALog(@"   preferScreenshotsOverScreenRecording = %d", (int)[gSession respondsToSelector:sPref]);
+
+    if ([gSession respondsToSelector:sSupp]) {
+        @try {
+            BOOL b = ((BOOL (*)(id, SEL))objc_msgSend)(gSession, sSupp);
+            ALog(@"   supportsScreenRecording 返回值 = %d", (int)b);
+        } @catch (NSException *e) { ALog(@"   调用异常: %@", e.reason); }
+    }
+    if ([gSession respondsToSelector:sActive]) {
+        @try {
+            BOOL b = ((BOOL (*)(id, SEL))objc_msgSend)(gSession, sActive);
+            ALog(@"   isScreenRecordingActive 返回值 = %d", (int)b);
+        } @catch (NSException *e) { ALog(@"   调用异常: %@", e.reason); }
+    }
+
+    ALog(@"--- 类结构 ---");
+    AXDumpClass(@"XCTScreenRecordingRequest");
+    AXDumpClass(@"XCTAttachmentFuture");
+    AXDumpClass(@"XCUILocalDeviceScreenRecordingIPCInterface");
+    AXDumpClass(@"XCUILocalDeviceScreenDataSource");
+
+    // 试构造 request
+    Class reqCls = NSClassFromString(@"XCTScreenRecordingRequest");
+    id req = nil;
+    if (reqCls) {
+        @try {
+            req = [[reqCls alloc] init];
+            ALog(@"✅ [[XCTScreenRecordingRequest alloc] init] = %p", (__bridge void *)req);
+            // 打印所有可读属性值
+            unsigned int pn = 0;
+            objc_property_t *props = class_copyPropertyList(reqCls, &pn);
+            for (unsigned i = 0; i < pn; i++) {
+                const char *nm = property_getName(props[i]);
+                @try {
+                    id v = [req valueForKey:[NSString stringWithUTF8String:nm]];
+                    ALog(@"     属性 %s = %@", nm, v);
+                } @catch (NSException *e) { ALog(@"     属性 %s → %@", nm, e.reason); }
+            }
+            free(props);
+        } @catch (NSException *e) {
+            ALog(@"❌ request init 异常: %@ / %@", e.name, e.reason);
+        }
+    }
+
+    // 真调一次
+    SEL start = NSSelectorFromString(@"startScreenRecordingWithRequest:withReply:");
+    ALog(@"startScreenRecordingWithRequest:withReply: 存在 = %d", (int)[gSession respondsToSelector:start]);
+    if (req && [gSession respondsToSelector:start]) {
+        @try {
+            void (^reply)(id, id) = ^(id future, id err) {
+                ALog(@"  📥 录屏 reply: future=%@(%@)  err=%@",
+                     future ? NSStringFromClass([future class]) : @"nil",
+                     future ?: @"",
+                     err ?: @"nil");
+                if (future) {
+                    AXDumpClass(NSStringFromClass([future class]));
+                    @try {
+                        if ([future respondsToSelector:NSSelectorFromString(@"isFulfilled")]) {
+                            BOOL f = ((BOOL (*)(id, SEL))objc_msgSend)(future, NSSelectorFromString(@"isFulfilled"));
+                            ALog(@"     future.isFulfilled = %d", (int)f);
+                        }
+                    } @catch (NSException *e) { ALog(@"     future 探测异常: %@", e.reason); }
+                }
+            };
+            void (*fp)(id, SEL, id, id) = (void (*)(id, SEL, id, id))objc_msgSend;
+            fp(gSession, start, req, reply);
+            ALog(@"✅ 已发起 startScreenRecording（等 3 秒看回调）");
+            [NSThread sleepForTimeInterval:3.0];
+        } @catch (NSException *e) {
+            ALog(@"❌ startScreenRecording 异常: %@ / %@", e.name, e.reason);
+        }
+    }
+    ALog(@"===== 录屏流探针结束 =====");
+    return @"probe done";
+}
+
+#pragma mark - 节点树（AX 元素树读取）
+
+/* 对任意 AX 元素取属性：优先 attributeValueForKey:，退回 valueForKey: */
+static id AXNodeAttr(id elem, NSString *key) {
+    if (!elem) return nil;
+    SEL s1 = NSSelectorFromString(@"attributeValueForKey:");
+    if ([elem respondsToSelector:s1]) {
+        @try {
+            id (*fp)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+            id v = fp(elem, s1, key);
+            if (v) return v;
+        } @catch (NSException *e) { }
+    }
+    SEL s2 = NSSelectorFromString(@"valueForKey:");
+    if ([elem respondsToSelector:s2]) {
+        @try {
+            id (*fp)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+            return fp(elem, s2, key);
+        } @catch (NSException *e) { }
+    }
+    return nil;
+}
+
+static NSString *AXShort(id v) {
+    if (!v) return @"-";
+    if ([v isKindOfClass:[NSString class]]) {
+        NSString *s = (NSString *)v;
+        if (s.length == 0) return @"\"\"";
+        if (s.length > 60) s = [[s substringToIndex:60] stringByAppendingString:@"…"];
+        return s;
+    }
+    if ([v isKindOfClass:[NSNumber class]]) return [v description];
+    if ([v isKindOfClass:[NSArray class]])
+        return [NSString stringWithFormat:@"<array %lu>", (unsigned long)[(NSArray *)v count]];
+    return NSStringFromClass([v class]);
+}
+
+static void AXDumpNode(id elem, int depth, int *count, int maxNodes) {
+    if (!elem || *count >= maxNodes || depth > 8) return;
+    (*count)++;
+
+    NSString *label = AXShort(AXNodeAttr(elem, @"label"));
+    NSString *ident = AXShort(AXNodeAttr(elem, @"identifier"));
+    NSString *value = AXShort(AXNodeAttr(elem, @"value"));
+    NSString *type  = AXShort(AXNodeAttr(elem, @"elementType"));
+
+    NSMutableString *pad = [NSMutableString string];
+    for (int i = 0; i < depth; i++) [pad appendString:@"  "];
+    ALog(@"%@· %@ type=%@ label=%@ id=%@ val=%@",
+         pad, NSStringFromClass([elem class]), type, label, ident, value);
+
+    id kids = AXNodeAttr(elem, @"children");
+    if (![kids isKindOfClass:[NSArray class]]) return;
+    for (id k in (NSArray *)kids) {
+        if (*count >= maxNodes) break;
+        AXDumpNode(k, depth + 1, count, maxNodes);
+    }
+}
+
+/* ★ 探测设备标识：XCUIScreen.device（XCUIDevice）的 uniqueIdentifier。
+   mirror_stream 那套私有 IOKit 我们用不了，但自动化会话里的 XCUIDevice 可能
+   曝光了设备标识 —— 有它就不需要 PC 端经 10010 传 UDID 了。 */
+/* ★ MobileGestalt 试探：普通签名大概率 NULL，但一次构建能验证全部 key */
+extern "C" NSString *AXTryMobileGestalt(void) {
+    ALogShim(@"===== MobileGestalt 试探 =====");
+    void *h = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_NOW);
+    if (!h) { ALogShim(@"  ❌ libMobileGestalt 打不开: %s", dlerror()); return @"no lib"; }
+    typedef CFTypeRef (*MGFn)(CFStringRef);
+    MGFn fn = (MGFn)dlsym(h, "MGCopyAnswer");
+    if (!fn) { ALogShim(@"  ❌ 无 MGCopyAnswer"); return @"no fn"; }
+
+    NSString *keys[] = { @"UniqueDeviceID", @"UniqueDeviceIDData", @"SerialNumber",
+                         @"ProductType", @"ModelNumber", @"MobileEquipmentIdentifier",
+                         @"InternationalMobileSubscriberIdentity", @"DeviceName",
+                         @"ProductVersion", @"BuildVersion", @"CPUArchitecture" };
+    int nk = (int)(sizeof(keys) / sizeof(keys[0]));
+    NSString *found = nil;
+    for (int ki = 0; ki < nk; ki++) {
+        NSString *k = keys[ki];
+        @try {
+            CFTypeRef v = fn((__bridge CFStringRef)k);
+            NSString *desc = @"(NULL)";
+            if (v) {
+                if (CFGetTypeID(v) == CFStringGetTypeID()) desc = [(__bridge NSString *)v copy];
+                else if (CFGetTypeID(v) == CFDataGetTypeID()) desc = [NSString stringWithFormat:@"<data %lu>", (unsigned long)CFDataGetLength((CFDataRef)v)];
+                else desc = NSStringFromClass([(__bridge id)v class]);
+            }
+            ALogShim(@"  · %@ → %@", k, desc);
+            if (v && found == nil && [k isEqualToString:@"UniqueDeviceID"] && desc.length > 5) found = desc;
+            if (v && CFGetTypeID(v)) CFRelease(v);
+        } @catch (NSException *e) { ALogShim(@"  · %@ 异常: %@", k, e.reason); }
+    }
+    return found ?: @"gestalt-no-udid";
+}
+
+extern "C" NSString *AXProbeDeviceInfo(void) {
+    ALogShim(@"===== 设备标识探测 =====");
+    ALogShim(@"--- 0) MobileGestalt ---");
+    NSString *g = AXTryMobileGestalt();
+    if (g && ![g hasPrefix:@"gestalt-"] && ![g hasPrefix:@"no "]) {
+        ALogShim(@"✅ MobileGestalt 给出了 UDID，直接采用");
+        AXStreamSetUDID(g);
+        return g;
+    }
+    if (!gReady) { ALogShim(@"❌ 会话未就绪"); return @"not ready"; }
+
+    Class scrCls = NSClassFromString(@"XCUIScreen");
+    if (!scrCls) return @"no XCUIScreen";
+    id screen = ((id (*)(id, SEL))objc_msgSend)(scrCls, NSSelectorFromString(@"mainScreen"));
+    if (!screen) return @"no screen";
+
+    /* 1) XCUIScreen.device */
+    SEL devSel = NSSelectorFromString(@"device");
+    id dev = nil;
+    if ([screen respondsToSelector:devSel]) {
+        dev = ((id (*)(id, SEL))objc_msgSend)(screen, devSel);
+        ALogShim(@"  · screen.device → %@ (%s)", dev ? @"有" : @"nil",
+                 dev ? object_getClassName(dev) : "-");
+    } else {
+        ALogShim(@"  · screen 无 device 属性");
+    }
+
+    /* 2) XCUIDevice sharedDevice 路线 */
+    Class devCls = NSClassFromString(@"XCUIDevice");
+    id sd = dev;
+    if (!sd && devCls) {
+        sd = AXShared(devCls, @[@"sharedDevice", @"localDevice"]);
+    }
+    if (!sd) { ALogShim(@"❌ 拿不到 XCUIDevice 实例"); return @"no device"; }
+
+    /* 3) uniqueIdentifier */
+    SEL uidSel = NSSelectorFromString(@"uniqueIdentifier");
+    if ([sd respondsToSelector:uidSel]) {
+        @try {
+            id v = ((id (*)(id, SEL))objc_msgSend)(sd, uidSel);
+            ALogShim(@"  ✅ uniqueIdentifier = %@", v);
+            if ([v isKindOfClass:[NSString class]] && ((NSString *)v).length > 0) {
+                AXStreamSetUDID(v);
+                ALogShim(@"  ✅ 已同步给 AXStream（preamble 将使用该标识）");
+                return v;
+            }
+        } @catch (NSException *e) { ALogShim(@"  ❌ uniqueIdentifier 异常: %@", e.reason); }
+    } else {
+        ALogShim(@"  · uniqueIdentifier 不存在");
+    }
+
+    /* 4) 顺带 dump 这个类，看还有没有别的标识接口 */
+    AXDumpClass(@"XCUIDevice");
+    return @"no uid";
+}
+
+/* 路线 B：直接用 XCUIApplication 拿 accessibilityElement（不走 XCAXClient_iOS） */
+static id AXElementViaXCUIApplication(void) {
+    Class appCls = NSClassFromString(@"XCUIApplication");
+    if (!appCls) { ALog(@"  · XCUIApplication 不存在"); return nil; }
+
+    SEL sAlloc = NSSelectorFromString(@"alloc");
+    SEL sInitBid = NSSelectorFromString(@"initWithBundleIdentifier:");
+    SEL sInit = NSSelectorFromString(@"init");
+    SEL sAccEl = NSSelectorFromString(@"accessibilityElement");
+
+    /* B1: initWithBundleIdentifier: */
+    if ([appCls instancesRespondToSelector:sInitBid]) {
+        for (NSString *bid in @[@"com.apple.springboard"]) {
+            @try {
+                id obj = ((id (*)(id, SEL))objc_msgSend)(appCls, sAlloc);
+                id app = ((id (*)(id, SEL, id))objc_msgSend)(obj, sInitBid, bid);
+                ALog(@"  · XCUIApplication(%@) = %@", bid, app ? @"ok" : @"nil");
+                if (!app) continue;
+                ALog(@"     respondsToSelector(accessibilityElement) = %d",
+                     (int)[app respondsToSelector:sAccEl]);
+                if ([app respondsToSelector:sAccEl]) {
+                    id el = ((id (*)(id, SEL))objc_msgSend)(app, sAccEl);
+                    ALog(@"     accessibilityElement → %@",
+                         el ? NSStringFromClass([el class]) : @"nil");
+                    if (el) return el;
+                }
+            } @catch (NSException *e) {
+                ALog(@"  · XCUIApplication(%@) 异常: %@ / %@", bid, e.name, e.reason);
+            }
+        }
+    } else {
+        ALog(@"  · XCUIApplication 无 initWithBundleIdentifier:");
+    }
+
+    /* B2: 无参 init（用测试配置里的 target） */
+    if ([appCls instancesRespondToSelector:sInit]) {
+        @try {
+            id obj = ((id (*)(id, SEL))objc_msgSend)(appCls, sAlloc);
+            id app = ((id (*)(id, SEL))objc_msgSend)(obj, sInit);
+            ALog(@"  · XCUIApplication() = %@", app ? @"ok" : @"nil");
+            if (app && [app respondsToSelector:sAccEl]) {
+                id el = ((id (*)(id, SEL))objc_msgSend)(app, sAccEl);
+                ALog(@"     accessibilityElement → %@",
+                     el ? NSStringFromClass([el class]) : @"nil");
+                if (el) return el;
+            }
+        } @catch (NSException *e) {
+            ALog(@"  · XCUIApplication() 异常: %@ / %@", e.name, e.reason);
+        }
+    }
+    return nil;
+}
+
+#pragma mark - 路线 C：AXRuntime + AXUIElement（照 AScript 的做法）
+
+/* AScript 二进制里的做法（反编译所得）：
+     dlopen "/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime"
+     dlsym  AXUIElementCreateSystemWide / AXUIElementGetPid / AXUIElementCopyAttributeValue
+     读 AXFocusedApplication → 递归 AXChildren，属性名用 "AXRole"/"AXTitle"/"AXValue"
+   它在普通签名下就能跑（二进制里没有 platform-application 等特权 entitlements），
+   所以这条路不依赖 UI test bundle，也不依赖 DDI。 */
+
+typedef void *(*AXCreateSystemWideFn)(void);
+typedef void *(*AXCreateAppFn)(pid_t pid);
+typedef int (*AXCopyAttrFn)(void *elem, CFStringRef attr, CFTypeRef *out);
+typedef int (*AXGetPidFn)(void *elem, pid_t *pid);
+
+static void *AXFindSymbol(const char *name) {
+    void *p = dlsym(RTLD_DEFAULT, name);
+    if (p) return p;
+    static const char *fws[] = {
+        "/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime",
+        "/System/Developer/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime",
+        "/System/Library/PrivateFrameworks/AccessibilityUtilities.framework/AccessibilityUtilities",
+        NULL
+    };
+    for (int i = 0; fws[i]; i++) {
+        void *h = dlopen(fws[i], RTLD_NOW | RTLD_GLOBAL);
+        if (!h) continue;
+        p = dlsym(h, name);
+        if (p) return p;
+    }
+    return NULL;
+}
+
+/* 读一个 AX 属性并转成可打印字符串（只处理 String/Number，其它返回类名） */
+static NSString *AXAttrToStr(void *elem, AXCopyAttrFn copyAttr, NSString *key) {
+    if (!elem || !copyAttr) return nil;
+    CFTypeRef v = NULL;
+    int err = copyAttr(elem, (__bridge CFStringRef)key, &v);
+    if (err != 0 || !v) return nil;
+    NSString *s = nil;
+    CFTypeID t = CFGetTypeID(v);
+    if (t == CFStringGetTypeID()) {
+        s = [(__bridge NSString *)v copy];
+    } else if (t == CFNumberGetTypeID()) {
+        s = [(__bridge NSNumber *)v description];
+    } else if (t == CFBooleanGetTypeID()) {
+        s = [(__bridge NSNumber *)v boolValue] ? @"true" : @"false";
+    } else if (t == CFArrayGetTypeID()) {
+        s = [NSString stringWithFormat:@"<array %ld>", (long)CFArrayGetCount((CFArrayRef)v)];
+    }
+    CFRelease(v);
+    if (s && s.length > 60) s = [[s substringToIndex:60] stringByAppendingString:@"…"];
+    return s;
+}
+
+static void AXDumpAXNode(void *node, int depth, int *count, int maxNodes,
+                         AXCopyAttrFn copyAttr, AXGetPidFn getPid) {
+    if (!node || *count >= maxNodes || depth > 10) return;
+    (*count)++;
+
+    NSString *role   = AXAttrToStr(node, copyAttr, @"AXRole");
+    NSString *title  = AXAttrToStr(node, copyAttr, @"AXTitle");
+    NSString *label  = AXAttrToStr(node, copyAttr, @"AXLabel");
+    NSString *value  = AXAttrToStr(node, copyAttr, @"AXIdentifier");
+    NSString *val    = AXAttrToStr(node, copyAttr, @"AXValue");
+    pid_t p = -1;
+    if (getPid) { @try { getPid(node, &p); } @catch (NSException *e) { } }
+
+    NSMutableString *pad = [NSMutableString string];
+    for (int i = 0; i < depth; i++) [pad appendString:@"  "];
+    ALog(@"%@· %@ pid=%d role=%@ title=%@ label=%@ id=%@ val=%@",
+         pad, role ?: @"?", (int)p, role ?: @"-", title ?: @"-", label ?: @"-",
+         value ?: @"-", val ?: @"-");
+
+    CFTypeRef kids = NULL;
+    int err = copyAttr(node, CFSTR("AXChildren"), &kids);
+    if (err == 0 && kids && CFGetTypeID(kids) == CFArrayGetTypeID()) {
+        CFArrayRef arr = (CFArrayRef)kids;
+        CFIndex n = CFArrayGetCount(arr);
+        for (CFIndex i = 0; i < n; i++) {
+            if (*count >= maxNodes) break;
+            void *ch = (void *)CFArrayGetValueAtIndex(arr, i);
+            AXDumpAXNode(ch, depth + 1, count, maxNodes, copyAttr, getPid);
+        }
+    }
+    if (kids) CFRelease(kids);
+}
+
+/* 打印某个方法完整的 type encoding —— 决定能不能安全调用它 */
+static const char *AXMethodTypes(Class cls, NSString *selName, char *buf, size_t buflen) {
+    if (!cls) return NULL;
+    Method m = class_getInstanceMethod(cls, NSSelectorFromString(selName));
+    if (!m) return NULL;
+    const char *t = method_getTypeEncoding(m);
+    if (!t) return NULL;
+    snprintf(buf, buflen, "%s", t);
+    return buf;
+}
+
+/* 解析返回值 + 第一个参数的类型字符（跳过 self/_cmd 和偏移数字） */
+static void AXParseTypes(const char *types, char *ret, size_t rl, char *arg1, size_t al) {
+    ret[0] = 0; arg1[0] = 0;
+    if (!types) return;
+    const char *p = types;
+    size_t i = 0;
+    while (*p && *p != ':' && i + 1 < rl) ret[i++] = *p++;
+    ret[i] = 0;
+    /* 找到第二个 ':' 之后 */
+    const char *c = strchr(types, ':');
+    if (!c) return;
+    c++;
+    while (*c && (isdigit((unsigned char)*c) || *c == '+' || *c == '-')) c++;
+    c = strchr(c, ':');
+    if (!c) return;
+    c++;
+    while (*c && isdigit((unsigned char)*c)) c++;
+    i = 0;
+    while (*c && i + 1 < al) arg1[i++] = *c++;
+    arg1[i] = 0;
+}
+
+/* 尝试调用 XCAXClient_iOS 的 loadAccessibility:（AScript 里出现 8 次的那个）
+   ★ 参数类型不明确时只记录、不调用 —— 传错 block 会 SIGSEGV，@try 接不住 */
+static BOOL AXTryLoadAccessibility(id client) {
+    if (!client) return NO;
+    BOOL any = NO;
+    NSArray<NSString *> *sels = @[@"loadAccessibility:", @"_loadAccessibility:"];
+    for (NSString *name in sels) {
+        SEL s = NSSelectorFromString(name);
+        if (![client respondsToSelector:s]) { ALog(@"  · %@ 不存在", name); continue; }
+
+        char tb[128]; char ret[32]; char arg[32];
+        const char *t = AXMethodTypes([client class], name, tb, sizeof(tb));
+        if (!t) { ALog(@"  · %@ 无 type encoding", name); continue; }
+        AXParseTypes(t, ret, sizeof(ret), arg, sizeof(arg));
+        ALog(@"  · %@ types=%s  返回=%s  参数1=%s", name, t, ret, arg);
+
+        /* 指针参数（NSError**）→ 传 NULL，安全 */
+        if (arg[0] == '^') {
+            @try {
+                ((void (*)(id, SEL, void *))objc_msgSend)(client, s, NULL);
+                ALog(@"  ✅ %@(NULL) 调用完成", name);
+                any = YES;
+            } @catch (NSException *e) { ALog(@"  ❌ %@ 异常: %@", name, e.reason); }
+        } else if (arg[0] == 'd' || arg[0] == 'f') {
+            @try {
+                ((void (*)(id, SEL, double))objc_msgSend)(client, s, 3.0);
+                ALog(@"  ✅ %@(3.0) 调用完成", name);
+                any = YES;
+            } @catch (NSException *e) { ALog(@"  ❌ %@ 异常: %@", name, e.reason); }
+        } else {
+            ALog(@"  ⚠️ %@ 参数是 '%s'（可能是 block），本版不调用，避免崩溃", name, arg);
+        }
+    }
+    return any;
+}
+
+/* 返回读到的节点数（-1 = 失败）；每一步的 AXError 都打进日志（err=0 才是成功） */
+static int AXRootViaAXRuntime(int maxNodes) {
+    AXCreateSystemWideFn createSW = (AXCreateSystemWideFn)AXFindSymbol("AXUIElementCreateSystemWide");
+    AXCopyAttrFn copyAttr = (AXCopyAttrFn)AXFindSymbol("AXUIElementCopyAttributeValue");
+    AXGetPidFn getPid = (AXGetPidFn)AXFindSymbol("AXUIElementGetPid");
+
+    ALog(@"  · dlsym: CreateSystemWide=%p CopyAttributeValue=%p GetPid=%p",
+         (void *)createSW, (void *)copyAttr, (void *)getPid);
+    if (!createSW || !copyAttr) { ALog(@"  · ❌ AXRuntime 符号拿不到"); return -1; }
+
+    /* ★ 先开 AX 开关：建 XCAXClient_iOS 实例并调 loadAccessibility:
+       （AScript 二进制里 loadAccessibility 出现 8 次，我们之前一次都没调 —— 这大概率是
+         kAXErrorAPIDisabled(-25211) 的根源） */
+    Class axCls2 = NSClassFromString(@"XCAXClient_iOS");
+    if (axCls2) {
+        id client2 = nil;
+        @try {
+            id obj = ((id (*)(id, SEL))objc_msgSend)(axCls2, NSSelectorFromString(@"alloc"));
+            SEL ini = NSSelectorFromString(@"init");
+            if ([obj respondsToSelector:ini])
+                client2 = ((id (*)(id, SEL))objc_msgSend)(obj, ini);
+        } @catch (NSException *e) { ALog(@"  · client init 异常: %@", e.reason); }
+        ALog(@"  · XCAXClient_iOS 实例 = %p", (__bridge void *)client2);
+        AXTryLoadAccessibility(client2);
+    }
+
+    void *sys = createSW();
+    ALog(@"  · AXUIElementCreateSystemWide → %p", sys);
+    if (!sys) return -1;
+
+    /* 依次试几个入口属性（AScript 里这三个名字都出现过）
+       ★ CFSTR() 只接受字符串字面量，变量名必须走 (__bridge CFStringRef) */
+    NSArray<NSString *> *attrs = @[@"AXFocusedApplication",
+                                   @"AXFrontmostApplication",
+                                   @"AXFocusedUIElement"];
+    void *root = NULL;
+    for (NSString *a in attrs) {
+        CFTypeRef v = NULL;
+        int err = copyAttr(sys, (__bridge CFStringRef)a, &v);
+        ALog(@"  · %@ → err=%d val=%p", a, err, v);
+        if (err == 0 && v && !root) {
+            root = (void *)v;      /* 持有，稍后释放 */
+        } else if (v) {
+            CFRelease(v);
+        }
+    }
+    CFRelease(sys);
+
+    /* 自测：AXUIElementCreateApplication(自己) —— 如果连自己都 -25211，说明 AX 全局 disabled；
+       如果自己能读、只有 SystemWide 不行，那是跨进程权限问题，方向不同 */
+    if (!root) {
+        AXCreateAppFn createApp = (AXCreateAppFn)AXFindSymbol("AXUIElementCreateApplication");
+        ALog(@"  · dlsym CreateApplication=%p", (void *)createApp);
+        if (createApp) {
+            void *me = createApp((pid_t)getpid());
+            ALog(@"  · CreateApplication(self pid=%d) → %p", (int)getpid(), me);
+            if (me) {
+                CFTypeRef v = NULL;
+                int e2 = copyAttr(me, CFSTR("AXRole"), &v);
+                ALog(@"  · self AXRole → err=%d val=%p", e2, v);
+                if (v) CFRelease(v);
+                CFTypeRef k2 = NULL;
+                int e3 = copyAttr(me, CFSTR("AXChildren"), &k2);
+                ALog(@"  · self AXChildren → err=%d", e3);
+                if (k2) CFRelease(k2);
+                CFRelease(me);
+            }
+        }
+    }
+
+    if (!root) return -1;
+
+    int count = 0;
+    AXDumpAXNode(root, 0, &count, maxNodes, copyAttr, getPid);
+    ALog(@"  ✅ AX 树读到 %d 个节点", count);
+    CFRelease(root);
+    return count;
+}
+
+/* 动态调整 _XCTSetApplicationStateTimeout（截图 101ms 疑似被 100ms 超时吃掉） */
+extern "C" BOOL AXAgentSetAppStateTimeout(double v) {
+    void (*fn)(double) = (void (*)(double))AXFindSymbol("_XCTSetApplicationStateTimeout");
+    if (!fn) { ALog(@"❌ 找不到 _XCTSetApplicationStateTimeout"); return NO; }
+    @try {
+        fn(v);
+        ALog(@"✅ _XCTSetApplicationStateTimeout(%.3f)", v);
+        return YES;
+    } @catch (NSException *e) {
+        ALog(@"❌ 设置异常: %@", e.reason);
+        return NO;
+    }
+}
+
+#pragma mark - 底层截图（绕过 XCUIScreen 的三层包装，直接打 IPC）
+
+/* 反汇编得到的调用链：
+     -[XCUIScreen screenshot]
+       → screenshotWithEncoding:options:
+         → screenshotWithPreferredEncoding:rect:options:error:   (futureWithTimeout 包装)
+           → XCUILocalDeviceScreenDataSource requestScreenshotWithRequest:withReply:
+             → screenshotIPCInterface requestScreenshotWithRequest:withReply:   ← 真正的 101ms
+   这里直接构造 XCTScreenshotRequest 丢给 screenshotIPCInterface，跳过三层包装，
+   并把 IPC 对象的真实类名/方法表 dump 出来（之前按名字猜一直是错的）。 */
+extern "C" NSString *AXAgentShotLowLevel(int mode, double quality) {
+    if (!gReady) return @"not ready";
+    @autoreleasepool {
+        Class scrCls = NSClassFromString(@"XCUIScreen");
+        if (!scrCls) return @"no XCUIScreen";
+        id screen = ((id (*)(id, SEL))objc_msgSend)(scrCls, NSSelectorFromString(@"mainScreen"));
+        if (!screen) return @"no screen";
+
+        SEL sdSel = NSSelectorFromString(@"screenDataSource");
+        if (![screen respondsToSelector:sdSel]) return @"no screenDataSource";
+        id ds = ((id (*)(id, SEL))objc_msgSend)(screen, sdSel);
+        if (!ds) return @"nil datasource";
+
+        SEL ipcSel = NSSelectorFromString(@"screenshotIPCInterface");
+        if (![ds respondsToSelector:ipcSel]) return @"no screenshotIPCInterface";
+        id ipc = ((id (*)(id, SEL))objc_msgSend)(ds, ipcSel);
+        if (!ipc) return @"nil ipc";
+
+        /* ★ 真实类名（之前按 "XCUILocalDeviceScreenshotIPCInterface" 猜一直是错的） */
+        const char *ipcCls = object_getClassName(ipc);
+        static BOOL shot2Dumped = NO;
+        if (!shot2Dumped) {
+            shot2Dumped = YES;
+            ALog(@"  🔬 [shot2] datasource 类 = %s", object_getClassName(ds));
+            ALog(@"  🔬 [shot2] ipc 类 = %s", ipcCls);
+            AXDumpClass(@(ipcCls));
+        }
+
+        /* legacy 标志只是读一下，看当前值 */
+        SEL legSel = NSSelectorFromString(@"useLegacyScreenshotPath");
+        if ([ipc respondsToSelector:legSel]) {
+            BOOL b = ((BOOL (*)(id, SEL))objc_msgSend)(ipc, legSel);
+            ALog(@"  🔬 [shot2] useLegacyScreenshotPath = %d", (int)b);
+        } else {
+            ALog(@"  🔬 [shot2] 无 useLegacyScreenshotPath");
+        }
+
+        /* 构造 XCTScreenshotRequest */
+        Class reqCls = NSClassFromString(@"XCTScreenshotRequest");
+        if (!reqCls) { ALog(@"  ❌ 无 XCTScreenshotRequest"); return @"no request class"; }
+
+        Class qCls = NSClassFromString(@"XCTImageQuality");
+        id q = nil;
+        if (qCls) {
+            id qa = ((id (*)(id, SEL))objc_msgSend)(qCls, NSSelectorFromString(@"alloc"));
+            SEL qi = NSSelectorFromString(@"initWithImageQuality:");
+            if ([qa respondsToSelector:qi]) q = ((id (*)(id, SEL, double))objc_msgSend)(qa, qi, quality);
+        }
+        if (!q) { ALog(@"  ⚠️ 没有 XCTImageQuality，用 nil"); }
+
+        /* ★ IPC 层不认 CGRectNull / CGRectZero —— 必须给真实矩形，否则
+           daemon 直接回 "Empty screenshot requested."（反汇编里 datasource 会把 rect
+           原样重建丢给 IPC，null 就变成空请求）。
+           mode: 0 = 整屏(点) 1 = 半屏(点) 2 = 整屏(像素) */
+        CGSize pts = [UIScreen mainScreen].bounds.size;
+        CGFloat sc = [UIScreen mainScreen].scale;
+        CGRect rect;
+        if (mode == 1)      rect = CGRectMake(0, 0, pts.width * 0.5, pts.height * 0.5);
+        else if (mode == 2) rect = CGRectMake(0, 0, pts.width * sc, pts.height * sc);
+        else                rect = CGRectMake(0, 0, pts.width, pts.height);
+        ALog(@"  🔬 [shot2] rect = %.0f,%.0f %.0fx%.0f (mode=%d)", rect.origin.x, rect.origin.y,
+             rect.size.width, rect.size.height, mode);
+
+        /* screenID 用真实 displayID，硬传 0 也可能被判空 */
+        long long sid = 0;
+        SEL dSel = NSSelectorFromString(@"displayID");
+        if ([screen respondsToSelector:dSel]) {
+            sid = ((long long (*)(id, SEL))objc_msgSend)(screen, dSel);
+        }
+        ALog(@"  🔬 [shot2] screenID = %lld", sid);
+
+        SEL ri = NSSelectorFromString(@"initWithScreenID:rect:encoding:options:");
+        if (![reqCls instancesRespondToSelector:ri]) { ALog(@"  ❌ 无 initWithScreenID:rect:encoding:options:"); return @"no init"; }
+        id reqObj = ((id (*)(id, SEL))objc_msgSend)(reqCls, NSSelectorFromString(@"alloc"));
+        typedef id (*InitReqFn)(id, SEL, long long, CGRect, id, unsigned long);
+        id req = ((InitReqFn)objc_msgSend)(reqObj, ri, sid, rect, q, 0UL);
+        if (!req) { ALog(@"  ❌ request 构造失败"); return @"req nil"; }
+
+        SEL callSel = NSSelectorFromString(@"requestScreenshotWithRequest:withReply:");
+        if (![ipc respondsToSelector:callSel]) { ALog(@"  ❌ ipc 无 requestScreenshotWithRequest:withReply:"); return @"no call"; }
+
+        __block id gotValue = nil;
+        __block id gotErr = nil;
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+
+        CFTimeInterval t0 = CACurrentMediaTime();
+        void (^reply)(id, id) = ^(id v, id e) {
+            gotValue = v;
+            gotErr = e;
+            dispatch_semaphore_signal(sem);
+        };
+        @try {
+            ((void (*)(id, SEL, id, id))objc_msgSend)(ipc, callSel, req, reply);
+        } @catch (NSException *ex) {
+            ALog(@"  ❌ 调用异常: %@", ex.reason);
+            return @"call threw";
+        }
+        long waited = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)));
+        CFTimeInterval dt = (CACurrentMediaTime() - t0) * 1000.0;
+        if (waited != 0) { ALog(@"  ⏱ [shot2] 5s 超时，无回调"); return @"timeout"; }
+
+        ALog(@"  ⏱ [shot2] IPC 往返 %.0fms", dt);
+        if (gotErr) ALog(@"  ⚠️ [shot2] err = %@", gotErr);
+        if (!gotValue) { ALog(@"  ❌ [shot2] 返回 nil"); return @"nil image"; }
+
+        ALog(@"  🔬 [shot2] 返回值类 = %s", object_getClassName(gotValue));
+        /* 返回的可能是 XCTImage（有 data 方法）也可能是 UIImage */
+        NSData *jpeg = nil;
+        CFTimeInterval t1 = CACurrentMediaTime();
+        if ([gotValue respondsToSelector:NSSelectorFromString(@"data")]) {
+            id d = ((id (*)(id, SEL))objc_msgSend)(gotValue, NSSelectorFromString(@"data"));
+            if ([d isKindOfClass:[NSData class]]) {
+                NSData *raw = (NSData *)d;
+                ALog(@"  🔬 [shot2] data 长度 = %lu 字节", (unsigned long)raw.length);
+                UIImage *ui = [UIImage imageWithData:raw];
+                if (ui) {
+                    CGSize sz = ui.size;
+                    CGFloat k = 720.0 / MAX(sz.width, sz.height);
+                    if (k > 1.0) k = 1.0;
+                    CGSize ns = CGSizeMake(round(sz.width * k), round(sz.height * k));
+                    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
+                    fmt.scale = 1.0; fmt.opaque = YES;
+                    UIImage *out = ui;
+                    if (k < 1.0) {
+                        UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:ns format:fmt];
+                        CGFloat kk = k;
+                        out = [r imageWithActions:^(UIGraphicsImageRendererContext *c) {
+                            [ui drawInRect:CGRectMake(0, 0, ns.width, ns.height)];
+                            (void)kk;
+                        }];
+                    }
+                    jpeg = UIImageJPEGRepresentation(out, quality > 0 ? quality : 0.6);
+                    ALog(@"  📷 [shot2] %.0fx%.0f -> %.0fx%.0f  %luKB  (后处理 %.0fms)",
+                         sz.width, sz.height, out.size.width, out.size.height,
+                         (unsigned long)(jpeg.length / 1024), (CACurrentMediaTime() - t1) * 1000.0);
+                }
+            }
+        }
+        if (!jpeg) { ALog(@"  ⚠️ [shot2] 拿不到可编码数据"); return @"no data"; }
+        return [jpeg base64EncodedStringWithOptions:0];
+    }
+}
+
+/* 读当前可达的 AX 元素树。maxNodes 限制节点数（防止界面复杂时刷爆日志）。
+   返回摘要字符串；详细内容写 agent.log。 */
+extern "C" NSString *AXAgentDumpTree(int maxNodes) {
+    if (maxNodes <= 0) maxNodes = 120;
+    ALog(@"===== 节点树读取开始（max=%d）=====", maxNodes);
+    if (!gReady) { ALog(@"❌ 会话未就绪"); return @"not ready"; }
+
+    /* 无论成败都先把类结构摊开，方法名就是下次要用的线索 */
+    ALog(@"--- 类结构 ---");
+    AXDumpClass(@"XCAXClient_iOS");
+    AXDumpClass(@"XCUIApplication");
+    AXDumpClass(@"XCUIRemoteAccessibilityInterface");
+    AXDumpClass(@"XCUIApplicationProcessTracker");
+    AXDumpClass(@"XCAccessibilityElement");
+
+    /* ===== 路线 C 优先：AXRuntime + AXUIElement（AScript 的做法）===== */
+    ALog(@"--- 路线 C: AXRuntime + AXUIElement ---");
+    int axNodes = AXRootViaAXRuntime(maxNodes);
+    if (axNodes >= 0) {
+        ALog(@"===== 节点树结束（AXRuntime 路线，%d 个节点）=====", axNodes);
+        return [NSString stringWithFormat:@"nodes=%d", axNodes];
+    }
+    ALog(@"  · 路线 C 失败，继续试 A/B");
+
+    id root = nil;
+
+    /* 路线 A：XCAXClient_iOS 单例 / 手工 init */
+    Class axCls = NSClassFromString(@"XCAXClient_iOS");
+    if (axCls) {
+        id client = AXShared(axCls, @[@"sharedClient", @"defaultClient",
+                                      @"currentClient", @"client"]);
+        if (!client) {
+            @try {
+                id obj = ((id (*)(id, SEL))objc_msgSend)(axCls, NSSelectorFromString(@"alloc"));
+                SEL ini = NSSelectorFromString(@"init");
+                if ([obj respondsToSelector:ini]) {
+                    id c2 = ((id (*)(id, SEL))objc_msgSend)(obj, ini);
+                    ALog(@"  · XCAXClient_iOS alloc/init → %@",
+                         c2 ? NSStringFromClass([c2 class]) : @"nil");
+                    client = c2;
+                }
+            } @catch (NSException *e) {
+                ALog(@"  · XCAXClient_iOS alloc/init 异常: %@ / %@", e.name, e.reason);
+            }
+        }
+        if (client) {
+            for (NSString *n in @[@"focusedApplication", @"frontmostApplication",
+                                  @"systemWideElement", @"applicationElement"]) {
+                SEL s = NSSelectorFromString(n);
+                if (![client respondsToSelector:s]) { ALog(@"  · %@ 不存在", n); continue; }
+                @try {
+                    id r = ((id (*)(id, SEL))objc_msgSend)(client, s);
+                    ALog(@"  · %@ → %@", n, r ? NSStringFromClass([r class]) : @"nil");
+                    if (r && !root) root = r;
+                } @catch (NSException *e) { ALog(@"  · %@ 异常: %@", n, e.reason); }
+            }
+            if (!root) {
+                SEL sp = NSSelectorFromString(@"accessibilityElementForPid:");
+                if ([client respondsToSelector:sp]) {
+                    @try {
+                        id r = ((id (*)(id, SEL, int))objc_msgSend)(client, sp, (int)getpid());
+                        ALog(@"  · accessibilityElementForPid(%d) → %@", (int)getpid(),
+                             r ? NSStringFromClass([r class]) : @"nil");
+                        if (r) root = r;
+                    } @catch (NSException *e) { ALog(@"  · pid 版异常: %@", e.reason); }
+                }
+            }
+        }
+    }
+
+    /* 路线 B：XCUIApplication（XCAXClient_iOS 拿不到时的备用通道） */
+    if (!root) {
+        ALog(@"--- 路线 B: XCUIApplication ---");
+        root = AXElementViaXCUIApplication();
+    }
+
+    if (!root) { ALog(@"❌ 两条路线都没拿到根元素"); return @"no element"; }
+
+    int count = 0;
+    AXDumpNode(root, 0, &count, maxNodes);
+    ALog(@"===== 节点树结束：共 %d 个节点 =====", count);
+    return [NSString stringWithFormat:@"nodes=%d", count];
+}
+
+#pragma mark - AXStream 实现（原 AXStream.mm 并入，绕开 XcodeGen 收录问题）
+
+/* ---------------- 全局状态 ---------------- */
+static int              g_listenFd = -1;
+static volatile BOOL    g_running = NO;
+static pthread_t        g_acceptTid;
+static pthread_t        g_encTid;
+static pthread_mutex_t  g_clientMu = PTHREAD_MUTEX_INITIALIZER;
+static int              g_clients[4] = {-1, -1, -1, -1};
+
+/* 采集方案（提前声明：编码循环里要读它） */
+static volatile int g_scheme = 1;       /* 默认 1=ReplayKit 高清录屏流 */
+static volatile int g_rkFrames = 0;
+static volatile int g_rkFallback = 0;
+static volatile int g_profileCapture = 1;  /* 默认使用 ReplayKit */
+static volatile long long g_lastPCActiveMs = 0;
+static char g_connectedPCIP[64] = "192.168.1.34";
+static BOOL g_keepAliveUserEnabled = YES;
+static void AXReplayKitStopInternal(void);
+static volatile int     g_clientCount = 0;
+
+static VTCompressionSessionRef g_vt = NULL;
+static int              g_encW = 0, g_encH = 0;
+/* ★ 编码输入的像素缓冲池 + 复用的色彩空间（避免每帧分配 IOSurface） */
+static CVPixelBufferPoolRef g_pbPool = NULL;
+static int              g_pbPoolW = 0, g_pbPoolH = 0;
+static CGColorSpaceRef  g_rgbCS = NULL;
+/* ★ maxSide 变更后要求下一帧按新值重算编码尺寸。
+   不能直接把 g_encW/g_encH 清 0 —— accept 侧发 preamble 用的就是它们，
+   清 0 会让新客户端收到 0x0 的 preamble。 */
+static volatile int     g_encDirty = 0;
+/* ★ 2026-10-31 发热定位用「分段跑」开关（10010 的 {"cmd":"bench","mode":N}）。
+   手机烫的时候靠猜没用，把链路一段段摘掉看温度才准：
+     0 = 正常全链路（默认）
+     1 = 只截图      —— 只调 AXGrabEncodedData，拿到 NSData 直接丢；不解码、不编码、不发送
+     2 = 截图+解码+缩放 —— 再往下走到 CVPixelBuffer 写好；不编码、不发送
+     3 = 只编码发送  —— 完全不截图，用池里一块内存反复编码发出去（黑帧）
+     4 = 空转        —— 什么都不做，只留心跳（测量底线）
+   对比 0/1/2/3/4 时的 thermalState + 自身 CPU 就能指出热源在 daemon 截图、App 缩放，还是编码发送。 */
+static volatile int     g_benchMode = 0;
+/* 上一帧的屏幕像素尺寸（bench=3 时不能截图，要靠它算编码尺寸） */
+static CGSize           g_lastPxSize = {0, 0};
+static int              g_bitrate = 2000000;   /* 2 Mbps */
+static int              g_fps = 20;
+static int              g_maxSide = 720;
+
+static volatile long long g_ptsMs = 0;         /* 真实墙钟毫秒，严格单调 */
+static volatile BOOL    g_needConfig = YES;    /* 首帧 / 编码器重建后要发 SPS/PPS */
+static volatile double g_imgQuality = 0.10;   /* 截图压缩质量（0~1）。用户指定 0.1：
+                                                 全屏 JPEG 从 139KB 级降到几十 KB，
+                                                 daemon 编码和 XPC 回传都更快（这是每帧最大的一块）。 */
+static volatile int    g_decodeThumb = 2;     /* 「第二步」解码+缩放走哪条路：
+                                                 0 = 全解 + CGBitmapContext 重采样（最贵，留作对比）
+                                                 1 = ImageIO thumbnail（CPU 解码 + DCT 缩放）
+                                                 2 = GPU（CoreImage/Metal 直接 render 进 CVPixelBuffer，默认）
+                                                 2026-11-01：实测档1（只截图）不烫、档2（+解码+缩放）烫，
+                                                 热点就在这一步，默认改成 GPU 让 Metal 扛缩放和色彩转换。 */
+static volatile int    g_inputKick   = 0;
+static volatile long long g_capPauseUntil = 0;  /* 到此时刻前暂停抓图，先把 daemon 让给合成事件 */
+static volatile int    g_capPauseMs  = 0;       /* 停采时长（0=关闭）
+                                                   b77 曾改成 60（当时以为是 daemon 被截图占满导致连点被挤），
+                                                   后来日志证明真因是 implicitEventConfirmationInterval=5s
+                                                   没设成 0 —— 见 bootstrap 第 12 步。这里回退到 0。 */
+static volatile int    g_staticDrop  = 0;     /* ★ 2026-10-31 用户决定：默认关闭。
+                                                 理由：静止降帧会让「静止画面上点一下」永远要等下一帧
+                                                 （下限 2fps 时就是最多 500ms 才看到反应），而投屏的
+                                                 核心诉求是响应快，不是省电。留开关仅为将来需要时用。 */
+static volatile int    g_staticFps   = 8;     /* 仅当 g_staticDrop=1 时生效的静止下限帧率 */
+static char           g_imgUTI[64] = "public.jpeg";  /* 截图编码格式：public.jpeg / public.png */
+static volatile long long g_lastImgBytes = 0; /* 上帧 IPC 返回的图片字节数 */
+static volatile long long g_lastGrabMs = 0;   /* ★ 上帧「截图」耗时（XPC 往返 + 图片回传） */
+static volatile long long g_lastDecMs = 0;    /* 上帧解码耗时（心跳里打出来） */
+static volatile long long g_lastDrawMs = 0;   /* 上帧转 CVPixelBuffer + 缩放耗时 */
+static volatile int     g_force_key = 0;       /* ★ 新连接 → 强制下一帧 IDR（照 mirror_stream v46：
+                                                  PC 解码器必须从 IDR 起步，否则永远黑屏） */
+static volatile int     g_sentFrames = 0;
+static volatile int     g_lastErr = 0;
+static NSString         *g_lastErrMsg = nil;
+static volatile int     g_preambleSent = 0;
+static char             g_udid[128] = {0};   /* ★ 真 UDID：PC 端靠它把 27184 的流
+                                                  关联到 usbmux 里的真设备（b54） */
+
+/* ---------------- 小工具 ---------------- */
+
+static long long AXNowMs(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long long)tv.tv_sec * 1000LL + tv.tv_usec / 1000;
+}
+
+/* 本进程 CPU 占用（两次调用之间的平均百分比）。bench 各模式对比用 ——
+   task_basic_info 给的是累计 CPU 时间，必须自己求差，单次读数没有意义。 */
+static double AXSelfCPUPercent(void) {
+    static uint64_t lastCPU = 0, lastUs = 0;
+    struct task_basic_info_64 ti;
+    mach_msg_type_number_t cnt = TASK_BASIC_INFO_64_COUNT;
+    if (task_info(mach_task_self(), TASK_BASIC_INFO_64, (task_info_t)&ti, &cnt) != KERN_SUCCESS) {
+        return -1.0;
+    }
+    uint64_t cpu = (uint64_t)ti.user_time.seconds * 1000000ULL + (uint64_t)ti.user_time.microseconds
+                 + (uint64_t)ti.system_time.seconds * 1000000ULL + (uint64_t)ti.system_time.microseconds;
+    static mach_timebase_info_data_t tb;
+    if (tb.denom == 0) mach_timebase_info(&tb);
+    uint64_t nowUs = mach_absolute_time() * tb.numer / tb.denom / 1000ULL;
+    double pct = -1.0;
+    if (lastUs && nowUs > lastUs) {
+        pct = (double)(cpu - lastCPU) * 100.0 / (double)(nowUs - lastUs);
+    }
+    lastCPU = cpu; lastUs = nowUs;
+    return pct;
+}
+
+/* 系统热压力等级（公开 API）：nominal → fair → serious → critical */
+static const char *AXThermalStateStr(void) {
+    switch ([NSProcessInfo processInfo].thermalState) {
+        case NSProcessInfoThermalStateNominal:  return "nominal";
+        case NSProcessInfoThermalStateFair:     return "fair";
+        case NSProcessInfoThermalStateSerious:  return "serious";
+        case NSProcessInfoThermalStateCritical: return "critical";
+        default: break;
+    }
+    return "?";
+}
+
+/* 严格单调递增（同毫秒内 +1），照 mirror_stream.m v33 的 PTS 处理 */
+static long long AXNextPts(void) {
+    long long now = AXNowMs();
+    long long prev = g_ptsMs;
+    if (now <= prev) now = prev + 1;
+    g_ptsMs = now;
+    return now;
+}
+
+static void AXSetErr(int code, NSString *msg) {
+    g_lastErr = code;
+    g_lastErrMsg = msg;
+}
+
+static BOOL AXWriteAll(int fd, const void *buf, size_t len) {
+    const uint8_t *p = (const uint8_t *)buf;
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = send(fd, p + off, len - off, MSG_NOSIGNAL);
+        if (n <= 0) {
+            if (errno == EINTR) continue;
+            return NO;
+        }
+        off += (size_t)n;
+    }
+    return YES;
+}
+
+/* 发给所有已连接客户端；任一失败就把它摘掉 */
+static void AXBroadcast(const void *hdr, size_t hdrLen, const void *payload, size_t payLen) {
+    pthread_mutex_lock(&g_clientMu);
+    for (int i = 0; i < 4; i++) {
+        int fd = g_clients[i];
+        if (fd < 0) continue;
+        BOOL ok = AXWriteAll(fd, hdr, hdrLen);
+        if (ok && payload && payLen) ok = AXWriteAll(fd, payload, payLen);
+        if (!ok) {
+            close(fd);
+            g_clients[i] = -1;
+            g_clientCount--;
+            ALogShim(@"📺 客户端断开 fd=%d", fd);
+        }
+    }
+    pthread_mutex_unlock(&g_clientMu);
+}
+
+static void AXPut32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
+}
+static void AXPut64(uint8_t *p, uint64_t v) {
+    for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (56 - i * 8));
+}
+
+/* ---------------- 握手 ---------------- */
+
+static void AXSendPreamble(int fd, int w, int h, int maxSide) {
+    NSMutableData *d = [NSMutableData data];
+    uint8_t b[4];
+
+    AXPut32(b, 0xFFFFFFFEu); [d appendBytes:b length:4];   /* 哨兵 */
+    AXPut32(b, (uint32_t)w); [d appendBytes:b length:4];
+    AXPut32(b, (uint32_t)h); [d appendBytes:b length:4];
+    AXPut32(b, (uint32_t)maxSide); [d appendBytes:b length:4];
+
+    /* UDID：★ 必须发真 UDID（PC 端把 27184 的流关联到 usbmux 里的真机）。
+       普通 App 拿不到，由 PC 端经 10010 的 {"cmd":"udid"} 传进来；
+       没传过才退回 identifierForVendor（此时 PC 端会出现一台重复设备）。 */
+    NSString *udid = (g_udid[0] ? @(g_udid)
+                    : [[[UIDevice currentDevice] identifierForVendor] UUIDString] ?: @"axtouch");
+    NSData *ud = [udid dataUsingEncoding:NSUTF8StringEncoding];
+    AXPut32(b, (uint32_t)ud.length); [d appendBytes:b length:4];
+    [d appendData:ud];
+
+    /* 设备名：不发的话 PC 侧会白等 400ms 超时 */
+    NSString *nm = [[UIDevice currentDevice] name] ?: @"AXTouch";
+    NSData *nd = [nm dataUsingEncoding:NSUTF8StringEncoding];
+    AXPut32(b, (uint32_t)nd.length); [d appendBytes:b length:4];
+    [d appendData:nd];
+
+    /* codec id：置 v2，之后按 12B 包头 */
+    AXPut32(b, 0x68323634u); [d appendBytes:b length:4];
+
+    if (AXWriteAll(fd, d.bytes, d.length)) {
+        ALogShim(@"📺 preamble 已发 fd=%d %dx%d maxSide=%d", fd, w, h, maxSide);
+    } else {
+        ALogShim(@"📺 preamble 发送失败 fd=%d", fd);
+    }
+}
+
+/* session 头：12B，无 payload —— [4B flags(bit31)][4B w][4B h] */
+static void AXSendSessionHeader(int w, int h) {
+    uint8_t pkt[12];
+    memset(pkt, 0, sizeof(pkt));
+    pkt[0] = 0x80;                      /* bit31 of first 4 bytes = SESSION */
+    AXPut32(pkt + 4, (uint32_t)w);
+    AXPut32(pkt + 8, (uint32_t)h);
+    AXBroadcast(pkt, 12, NULL, 0);
+}
+
+/* 普通包：[8B ptsAndFlags][4B size][payload] */
+static void AXSendPacket(uint64_t ptsAndFlags, const void *payload, size_t len) {
+    uint8_t hdr[12];
+    AXPut64(hdr, ptsAndFlags);
+    AXPut32(hdr + 8, (uint32_t)len);
+    AXBroadcast(hdr, 12, payload, len);
+}
+
+/* ---------------- 编码器 ---------------- */
+
+static void AXVTCompressionCallback(void *outRefCon, void *srcFrameRefCon,
+                                    OSStatus status, VTEncodeInfoFlags infoFlags,
+                                    CMSampleBufferRef sbuf) {
+    if (status != noErr || !sbuf) {
+        if (status != noErr) AXSetErr((int)status, @"VT 编码失败");
+        return;
+    }
+    /* ★ VT 回调跑在自己的线程，没有 autorelease pool：每帧创建的 NSMutableData/
+       NSDictionary 会一直堆着不释放（120 帧后闪退的原因之一） */
+    @autoreleasepool {
+
+    /* ★ 照 mirror_stream.m 的逻辑：把 SPS/PPS（type 7/8）拆出来存 cfg，其余 NAL 拼 au；
+       关键帧时先发 CONFIG 再发 au —— PC 端把 CONFIG 缓存并拼到每帧前。
+       新连接后 g_force_key 强制 IDR + 立即发 CONFIG，PC 无需等待周期关键帧。 */
+    NSMutableData *cfg = [NSMutableData data];
+    NSMutableData *au = [NSMutableData data];
+    BOOL isKey = NO;
+    BOOL haveParams = NO;
+
+    {
+        CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sbuf);
+        size_t cnt = 0;
+        if (fmt && CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, 0, NULL, NULL, &cnt, NULL) == noErr && cnt > 0) {
+            haveParams = YES;
+            for (size_t i = 0; i < cnt; i++) {
+                const uint8_t *ps = NULL;
+                size_t psLen = 0;
+                if (CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, i, &ps, &psLen, NULL, NULL) == noErr && ps && psLen) {
+                    uint8_t sc[4] = {0, 0, 0, 1};
+                    [cfg appendBytes:sc length:4];
+                    [cfg appendBytes:ps length:psLen];
+                }
+            }
+        }
+    }
+
+    /* 取 NAL（VT 输出已是 Annex-B，带起始码） */
+    CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sbuf);
+    if (!bb) return;
+    size_t len = CMBlockBufferGetDataLength(bb);
+    if (len == 0) return;
+
+    NSMutableData *raw = [NSMutableData dataWithLength:len];
+    if (CMBlockBufferCopyDataBytes(bb, 0, len, raw.mutableBytes) != kCMBlockBufferNoErr) return;
+
+    /* ★ VT 输出的是 AVCC（每 NAL 前 4B 长度前缀），PC 端要 Annex-B（00 00 00 01）。
+       不转的话 PC 的 hasAnnexBStartCode 一检查就丢帧 → 黑屏。 */
+    NSMutableData *nal = [NSMutableData dataWithCapacity:len + 32];
+    {
+        const uint8_t *p = (const uint8_t *)raw.bytes;
+        size_t total = raw.length, off = 0;
+        while (off + 4 <= total) {
+            uint32_t n = ((uint32_t)p[off] << 24) | ((uint32_t)p[off + 1] << 16)
+                       | ((uint32_t)p[off + 2] << 8) | (uint32_t)p[off + 3];
+            off += 4;
+            if (n == 0 || off + n > total) break;
+            uint8_t sc[4] = {0, 0, 0, 1};
+            [au appendBytes:sc length:4];
+            [au appendBytes:p + off length:n];
+            uint8_t nt = (uint8_t)(p[off] & 0x1F);
+            if (nt == 7 || nt == 8) {            /* SPS / PPS */
+                [cfg appendBytes:sc length:4];
+                [cfg appendBytes:p + off length:n];
+            }
+            if (nt == 5) isKey = YES;            /* IDR */
+            off += n;
+        }
+    }
+    if (au.length == 0) return;
+    if (g_needConfig && haveParams) {
+        [au replaceBytesInRange:NSMakeRange(0, 0) withBytes:cfg.bytes length:cfg.length];  /* 头部插入 */
+        g_needConfig = NO;
+    }
+
+    /* 关键帧判断：NAL 里有 IDR 就算（跟 ios-daemon 一致，不依赖 NotSync 附件） */
+    CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(sbuf, false);
+    if (atts && CFArrayGetCount(atts) > 0) {
+        NSDictionary *d = (__bridge NSDictionary *)CFArrayGetValueAtIndex(atts, 0);
+        if (d && [d objectForKey:(__bridge id)kCMSampleAttachmentKey_NotSync]
+            && [(NSNumber *)[d objectForKey:(__bridge id)kCMSampleAttachmentKey_NotSync] boolValue])
+            isKey = isKey;                       /* NotSync=1 时以 NAL 扫描结果为准 */
+    }
+
+    uint64_t ptsUs = (uint64_t)(AXNextPts() * 1000);              /* ★ 微秒（与安卓一致） */
+    uint64_t flags = isKey ? ((uint64_t)1 << 61) : 0;
+    if (isKey && cfg.length > 0) {
+        AXSendPacket((uint64_t)1 << 62, cfg.bytes, cfg.length);   /* ★ 关键帧前先发 CONFIG */
+        ALogShim(@"📺 关键帧，已发 CONFIG %lu 字节", (unsigned long)cfg.length);
+    }
+    uint64_t ptsAndFlags = (ptsUs & ~((uint64_t)1 << 63 | (uint64_t)1 << 62 | (uint64_t)1 << 61)) | flags;
+    AXSendPacket(ptsAndFlags, au.bytes, au.length);
+    g_sentFrames++;
+    }   /* @autoreleasepool */
+}
+
+static OSType g_vtFmt = 0;      /* 当前 VT 会话的源像素格式 */
+static long long g_vtDropAt = 0; /* 上次丢弃会话的时间（诊断用） */
+
+/* 丢弃当前会话：下次 AXVTEnsureWithFormat 会重建。
+   ★ 必须同时清 preamble 标记：新会话的 SPS/PPS 变了，客户端要重新收一遍。 */
+static void AXVTDrop(const char *why) {
+    if (g_vt) {
+        VTCompressionSessionCompleteFrames(g_vt, kCMTimeInvalid);
+        VTCompressionSessionInvalidate(g_vt);
+        CFRelease(g_vt);
+        g_vt = NULL;
+    }
+    g_vtFmt = 0;
+    /* ★★ 2026-10-31 崩溃根因（PC 端闪退）：
+       以前这里把 g_preambleSent 清零 → 下一帧会对**已连接的客户端再发一遍 preamble**。
+       PC 的包解析器按 12B 包头读，preamble 的字节被当成包头 → 解出荒谬宽高
+       （实测 0x201fb3c2 × 0x40000000）→ image.NewRGBA 分配 1GB → makeslice panic 闪退。
+       preamble 是**连接级**的（只在 accept 时发一次），重建编码会话只需要重发 SPS/PPS：
+       g_needConfig=YES 会让下一个关键帧前自动补 CONFIG，这就够了。
+       g_encW/g_encH 也保留：新客户端连进来时 accept 那侧还要用它发 preamble。 */
+    g_needConfig = YES;
+    ALogShim(@"♻️ 编码会话已丢弃（%s），下一帧重建（不重发 preamble，只补 SPS/PPS）", why ? why : "?");
+}
+
+/* 按指定源像素格式建会话：XCUITest 路径喂 BGRA，ReplayKit 路径喂它自己给的 420f/420v。
+   格式不匹配 VT 会直接拒绝编码，所以必须跟着首帧格式走。 */
+static BOOL AXVTEnsureWithFormat(int w, int h, OSType fmt) {
+    if (fmt == 0) fmt = kCVPixelFormatType_32BGRA;
+    if (g_vt && g_encW == w && g_encH == h && g_vtFmt == fmt) return YES;
+    if (g_vt) {
+        VTCompressionSessionCompleteFrames(g_vt, kCMTimeInvalid);
+        VTCompressionSessionInvalidate(g_vt);
+        CFRelease(g_vt);
+        g_vt = NULL;
+    }
+    NSDictionary *srcAttrs = @{
+        (NSString *)kCVPixelBufferPixelFormatTypeKey: @(fmt),
+        (NSString *)kCVPixelBufferWidthKey: @(w),
+        (NSString *)kCVPixelBufferHeightKey: @(h),
+    };
+    OSStatus st = VTCompressionSessionCreate(NULL, (int32_t)w, (int32_t)h,
+                                             kCMVideoCodecType_H264, NULL,
+                                             (__bridge CFDictionaryRef)srcAttrs,
+                                             NULL, AXVTCompressionCallback, NULL, &g_vt);
+    if (st != noErr || !g_vt) {
+        AXSetErr((int)st, [NSString stringWithFormat:@"VTCompressionSessionCreate 失败 st=%d", (int)st]);
+        ALogShim(@"❌ VT 创建失败 st=%d w=%d h=%d fmt=%u", (int)st, w, h, (unsigned)fmt);
+        return NO;
+    }
+    VTSessionSetProperty(g_vt, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
+    VTSessionSetProperty(g_vt, kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_High_AutoLevel);
+    VTSessionSetProperty(g_vt, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+    VTSessionSetProperty(g_vt, kVTCompressionPropertyKey_MaxKeyFrameInterval, (__bridge CFNumberRef)@(g_fps * 10));
+    VTSessionSetProperty(g_vt, kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef)@(g_fps));
+    VTSessionSetProperty(g_vt, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFNumberRef)@(g_bitrate));
+    VTCompressionSessionPrepareToEncodeFrames(g_vt);
+
+    g_encW = w; g_encH = h; g_vtFmt = fmt;
+    g_needConfig = YES;
+    g_ptsMs = 0;
+    ALogShim(@"✅ VT 会话建立 %dx%d fmt=%u vt=%p", w, h, (unsigned)fmt, (void *)g_vt);
+    ALogShim(@"✅ VT 编码器就绪 %dx%d fmt=%u  %d kbps  %d fps", w, h, (unsigned)fmt,
+             g_bitrate / 1000, g_fps);
+    return YES;
+}
+
+static BOOL AXVTEnsure(int w, int h) {
+    return AXVTEnsureWithFormat(w, h, kCVPixelFormatType_32BGRA);
+}
+
+
+/* ---------------- 采集：XCTest IPC 截图（与 shot2 同一条路） ---------------- */
+
+/* 返回：编码数据（NSData）或 nil。走 XCUIScreen 的 screenDataSource → screenshotIPCInterface。
+   rect 用真实尺寸（IPC 不认 CGRectNull）。 */
+static NSData *AXGrabEncodedData(CGSize *outSize) {
+    Class scrCls = NSClassFromString(@"XCUIScreen");
+    if (!scrCls) { AXSetErr(-1, @"XCUIScreen 不存在"); return nil; }
+    id screen = ((id (*)(id, SEL))objc_msgSend)(scrCls, NSSelectorFromString(@"mainScreen"));
+    if (!screen) { AXSetErr(-2, @"mainScreen 为 nil"); return nil; }
+
+    SEL sdSel = NSSelectorFromString(@"screenDataSource");
+    if (![screen respondsToSelector:sdSel]) { AXSetErr(-3, @"无 screenDataSource"); return nil; }
+    id ds = ((id (*)(id, SEL))objc_msgSend)(screen, sdSel);
+    SEL ipcSel = NSSelectorFromString(@"screenshotIPCInterface");
+    if (![ds respondsToSelector:ipcSel]) { AXSetErr(-4, @"无 screenshotIPCInterface"); return nil; }
+    id ipc = ((id (*)(id, SEL))objc_msgSend)(ds, ipcSel);
+    if (!ipc) { AXSetErr(-5, @"ipc 为 nil"); return nil; }
+
+    Class reqCls = NSClassFromString(@"XCTScreenshotRequest");
+    Class qCls = NSClassFromString(@"XCTImageQuality");
+    if (!reqCls || ![reqCls instancesRespondToSelector:NSSelectorFromString(@"initWithScreenID:rect:encoding:options:")]) {
+        AXSetErr(-6, @"无 XCTScreenshotRequest"); return nil;
+    }
+
+    /* 编码参数：优先自己造 XCTImageEncoding 指定「UTI + 压缩质量」——
+       这样能明确要 JPEG（XCTAutomationSupport 里就有 public.jpeg），
+       而不是靠 XCTImageQuality 猜 daemon 会给什么格式。
+       JPEG 支持 DCT 缩放解码（边解边缩），PNG 必须先解满再缩。 */
+    id q = nil;
+    Class encCls = NSClassFromString(@"XCTImageEncoding");
+    SEL encInit = NSSelectorFromString(@"initWithUniformTypeIdentifier:compressionQuality:");
+    if (encCls && [encCls instancesRespondToSelector:encInit]) {
+        NSString *uti = @(g_imgUTI);
+        if (uti.length == 0) uti = @"public.jpeg";
+        double qq = g_imgQuality;
+        if (qq <= 0) qq = 0.7;
+        if (qq > 1.0) qq = 1.0;
+        q = ((id (*)(id, SEL, id, double))objc_msgSend)([encCls alloc], encInit, uti, qq);
+        /* ★ 不要在这里打日志：本函数每帧调用一次（20fps），一行 ALogShim 就是
+           每秒 20 次字符串格式化 + 文件写，白烧 CPU 还会造成调度抖动。 */
+    }
+    if (!q && qCls) {
+        id qa = ((id (*)(id, SEL))objc_msgSend)(qCls, NSSelectorFromString(@"alloc"));
+        SEL qi = NSSelectorFromString(@"initWithImageQuality:");
+        if ([qa respondsToSelector:qi]) q = ((id (*)(id, SEL, double))objc_msgSend)(qa, qi, g_imgQuality);
+    }
+
+    CGSize pts = [UIScreen mainScreen].bounds.size;
+    CGRect rect = CGRectMake(0, 0, pts.width, pts.height);
+    long long sid = 0;
+    SEL dSel = NSSelectorFromString(@"displayID");
+    if ([screen respondsToSelector:dSel]) sid = ((long long (*)(id, SEL))objc_msgSend)(screen, dSel);
+
+    id reqObj = ((id (*)(id, SEL))objc_msgSend)(reqCls, NSSelectorFromString(@"alloc"));
+    typedef id (*InitReqFn)(id, SEL, long long, CGRect, id, unsigned long);
+    id req = ((InitReqFn)objc_msgSend)(reqObj, NSSelectorFromString(@"initWithScreenID:rect:encoding:options:"),
+                                       sid, rect, q, 0UL);
+    if (!req) { AXSetErr(-7, @"request 构造失败"); return nil; }
+
+    SEL callSel = NSSelectorFromString(@"requestScreenshotWithRequest:withReply:");
+    if (![ipc respondsToSelector:callSel]) { AXSetErr(-8, @"ipc 无 requestScreenshot"); return nil; }
+
+    __block NSData *result = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    void (^reply)(id, id) = ^(id v, id e) {
+        g_grabBusy = 0;                     /* ★ 截图回来了，daemon 不再被这张图占着 */
+        if (v && [v respondsToSelector:NSSelectorFromString(@"data")]) {
+            id d = ((id (*)(id, SEL))objc_msgSend)(v, NSSelectorFromString(@"data"));
+            if ([d isKindOfClass:[NSData class]]) result = (NSData *)d;
+        }
+        dispatch_semaphore_signal(sem);
+    };
+    /* ★ 标记「daemon 里正压着一张截图」：合成手势前要等它回来，否则事件排在这张图后面，
+       连点时第二下就会明显延迟甚至被丢。 */
+    g_grabBusy = 1;
+    ((void (*)(id, SEL, id, id))objc_msgSend)(ipc, callSel, req, reply);
+    if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC))) != 0) {
+        g_grabBusy = 0;
+        AXSetErr(-9, @"截图超时");
+        return nil;
+    }
+    if (!result) { AXSetErr(-10, @"截图返回空"); return nil; }
+
+    /* ★ 一次性确认 IPC 给的是什么编码（决定解码路径能不能优化）：
+       JPEG 支持 DCT 缩放解码（可以"边解边缩"），PNG 必须先解满再缩。
+       同时把大小打出来 —— 真视频内容下 PNG 会膨胀几倍，IPC 耗时会直接翻倍。 */
+    {
+        static int fmtLogged = 0;
+        if (!fmtLogged && result.length > 8) {
+            fmtLogged = 1;
+            const uint8_t *p = (const uint8_t *)result.bytes;
+            const char *fmt = "unknown";
+            if (p[0] == 0xFF && p[1] == 0xD8) fmt = "JPEG";
+            else if (p[0] == 0x89 && p[1] == 0x50) fmt = "PNG";
+            else if (p[0] == 0x42 && p[1] == 0x4D) fmt = "BMP";
+            ALogShim(@"🔍 IPC 截图格式=%s  %lu 字节  head=%02X%02X%02X%02X  imgQuality=%.2f",
+                     fmt, (unsigned long)result.length, p[0], p[1], p[2], p[3], g_imgQuality);
+        }
+    }
+
+    /* 尺寸信息从解码后的图里拿（调用方还要用来算编码尺寸） */
+    if (outSize) {
+        CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)result, NULL);
+        if (src) {
+            NSDictionary *props = CFBridgingRelease(CGImageSourceCopyPropertiesAtIndex(src, 0, NULL));
+            NSNumber *pw = props[(NSString *)kCGImagePropertyPixelWidth];
+            NSNumber *ph = props[(NSString *)kCGImagePropertyPixelHeight];
+            if (pw && ph) *outSize = CGSizeMake(pw.doubleValue, ph.doubleValue);
+            CFRelease(src);
+        }
+    }
+    return result;
+}
+
+/* ---------------- 编码循环 ---------------- */
+
+/* ================= 「第二步」的 GPU 落图 =================
+   第二步 = 截图 JPEG → 目标尺寸的 CVPixelBuffer。以前整段全在 CPU：
+       ImageIO 满幅解码 3.6MP  →  CGBitmapContext + CGContextDrawImage 重采样  →  IOSurface
+   现在（dec=2 / GPU）改成：
+       CIImage(数据直入)  →  按 tw×th 缩放（Lanczos，跑了在 GPU）  →  CIContext 直接 render 进像素缓冲
+   缩放、色彩转换、写 IOSurface 全部在 Metal 上，CPU 只剩「把 JPEG 熵解成图」这一小段
+   （iOS 没有公开的 GPU JPEG 解码接口，这一小段谁也搬不走；但它不再叠加一次满幅重采样）。
+
+   ★ 万一画面上下颠倒（不同 iOS 版本 CI 对 pixel buffer 的 y 轴处理不一致），
+     把下面 dst 改成 CGRectMake(0, -th, tw, th) 或给 out 加一个 scale(1,-1) 即可 —— 只影响这一处。 */
+static CIContext *g_ciCtx = nil;
+
+static BOOL AXGpuBlit(NSData *enc, CVPixelBufferRef pb, int tw, int th) {
+    if (!enc || !pb || tw <= 0 || th <= 0) return NO;
+    @autoreleasepool {
+        if (!g_ciCtx) {
+            /* options 里显式关掉软件渲染，逼它走 Metal；万一设备不支持 GPU 上下文会返回 nil，调用方退回 CPU 路径。 */
+            g_ciCtx = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer: @NO }];
+            if (!g_ciCtx) return NO;
+        }
+        CIImage *src = [CIImage imageWithData:enc];
+        if (!src) return NO;
+        CGRect ext = src.extent;
+        if (ext.size.width < 1 || ext.size.height < 1) return NO;
+
+        CGRect dst = CGRectMake(0, 0, (CGFloat)tw, (CGFloat)th);
+        CIImage *out = src;
+        if (fabs(ext.size.width - (CGFloat)tw) > 0.5 || fabs(ext.size.height - (CGFloat)th) > 0.5) {
+            CGAffineTransform t = CGAffineTransformMakeScale((CGFloat)tw / ext.size.width,
+                                                            (CGFloat)th / ext.size.height);
+            out = [src imageByApplyingTransform:t];
+            out = [out imageByCroppingToRect:dst];   /* 消掉浮点取整多出来的那半像素 */
+        }
+        if (!g_rgbCS) g_rgbCS = CGColorSpaceCreateDeviceRGB();
+        [g_ciCtx render:out toCVPixelBuffer:pb bounds:dst colorSpace:g_rgbCS];
+        return YES;
+    }
+}
+
+static void *AXEncodeLoop(void *arg) {
+    (void)arg;
+    ALogShim(@"🎬 编码循环启动");
+    int frameCount = 0;
+    long long statT0 = AXNowMs();
+    int statFrames = 0;
+    long long nextTick = AXNowMs();   /* 下一帧的调度时刻 */
+    int  staticStreak = 0;            /* 连续多少帧画面完全没变（用于降帧降温） */
+    NSData *lastEnc = nil;
+
+    while (g_running) {
+        @autoreleasepool {
+            if (g_scheme == 1) {
+                /* ReplayKit 模式：动态帧在采集回调里直接编码；
+                   当新客户端刚连入 (g_force_key / !g_preambleSent) 或画面静止超过 450ms 时，
+                   自动用缓存的最新帧（或窗口画面）补发保活帧，确保电脑秒出画面且绝不断流 */
+                if (g_clientCount > 0 && (g_force_key || !g_preambleSent || (AXNowMs() - g_lastFrameAtMs) >= 450)) {
+                    CVPixelBufferRef cachedPB = NULL;
+                    pthread_mutex_lock(&g_lastFrameMu);
+                    if (g_lastFramePB) cachedPB = CVPixelBufferRetain(g_lastFramePB);
+                    pthread_mutex_unlock(&g_lastFrameMu);
+                    if (cachedPB) {
+                        int cw = (int)CVPixelBufferGetWidth(cachedPB);
+                        int ch = (int)CVPixelBufferGetHeight(cachedPB);
+                        if (cw > 0 && ch > 0 && AXVTEnsureWithFormat(cw, ch, CVPixelBufferGetPixelFormatType(cachedPB))) {
+                            if (!g_preambleSent) {
+                                pthread_mutex_lock(&g_clientMu);
+                                for (int i = 0; i < 4; i++) {
+                                    if (g_clients[i] >= 0) AXSendPreamble(g_clients[i], cw, ch, g_maxSide);
+                                }
+                                pthread_mutex_unlock(&g_clientMu);
+                                AXSendSessionHeader(cw, ch);
+                                g_preambleSent = 1;
+                            }
+                            CFDictionaryRef fp = NULL;
+                            if (g_force_key) {
+                                fp = (__bridge CFDictionaryRef)@{ (NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES };
+                                g_force_key = 0;
+                            }
+                            CMTime pcm = CMTimeMake(AXNextPts(), 1000);
+                            VTCompressionSessionEncodeFrame(g_vt, cachedPB, pcm, kCMTimeInvalid, fp, NULL, NULL);
+                            g_lastFrameAtMs = AXNowMs();
+                        }
+                        CVPixelBufferRelease(cachedPB);
+                    }
+                }
+                usleep(120 * 1000);
+                continue;
+            }
+            if (g_clientCount <= 0 && g_benchMode == 0) {
+                /* 没人看就不抓，省电省 CPU。
+                   ★ bench 测试档例外：那几个档本来就故意不发帧（PC 端会判死重连），
+                   要是也卡在"没客户端就不跑"，测试就永远跑不起来、心跳也不打。 */
+                usleep(50 * 1000);
+                continue;
+            }
+            /* ★ 发热定位：空转档 —— 什么都不做，只留心跳（这是温度/CPU 的底线基准） */
+            if (g_benchMode == 4) {
+                if ((AXNowMs() - statT0) >= 5000) {
+                    ALogShim(@"❤️[bench4 空转] 热=%s cpu=%.0f%%（这是底线基准）",
+                             AXThermalStateStr(), AXSelfCPUPercent());
+                    statT0 = AXNowMs(); statFrames = 0;
+                }
+                usleep(30 * 1000);
+                continue;
+            }
+            /* ★ 发热定位：只截图档 —— 只把截图调出来就丢，不解码、不缩放、不编码、不发送。
+               如果这一档就已经烫，说明热源在 daemon 的全屏拍照本身，后面怎么优化都没用。 */
+            if (g_benchMode == 1) {
+                long long g0 = AXNowMs();
+                CGSize gp = CGSizeZero;
+                NSData *ge = AXGrabEncodedData(&gp);
+                g_lastGrabMs = AXNowMs() - g0;
+                if (ge) { g_lastImgBytes = (long long)ge.length; g_lastPxSize = gp; }
+                statFrames++;
+                if ((AXNowMs() - statT0) >= 5000) {
+                    ALogShim(@"❤️[bench1 只截图] fps=%d 图%luKB 截%lldms 热=%s cpu=%.0f%%",
+                             (int)(statFrames * 1000 / MAX(1, (AXNowMs() - statT0))),
+                             (unsigned long)(g_lastImgBytes / 1024), g_lastGrabMs,
+                             AXThermalStateStr(), AXSelfCPUPercent());
+                    statT0 = AXNowMs(); statFrames = 0;
+                }
+                long long iv = 1000 / MAX(1, g_fps);
+                long long spent = AXNowMs() - g0;
+                if (iv > spent) usleep((useconds_t)((iv - spent) * 1000));
+                continue;
+            }
+            /* 刚提交过手势 → 短暂停采，让 daemon 优先处理合成事件（否则点击要排队）
+               ★ 但这个窗口绝不能挡住输入唤醒：它是"让资源"，不是"让用户等"。
+               用户在这个窗口里又动了一下手指，说明他要的是立刻看到反应 → 立即结束停采。 */
+            if (g_capPauseMs > 0 && AXSeqMs() < g_capPauseUntil) {   /* 必须用同一个时钟（单调钟） */
+                if (g_inputKick) {
+                    g_capPauseUntil = 0;      /* 新手势来了：立刻恢复采集 */
+                    g_inputKick = 0;
+                } else {
+                    usleep(15 * 1000);
+                    continue;
+                }
+            }
+            if (g_clientCount > 0 && g_force_key == 0 && g_sentFrames == 0) {
+                /* 首帧也强制 IDR */
+                g_force_key = 1;
+            }
+
+            long long t0 = AXNowMs();
+            CGSize px = CGSizeZero;
+            NSData *enc = nil;
+            if (g_benchMode == 3) {
+                /* ★ 发热定位：只编码发送档 —— 完全不碰截图 daemon。
+                   第一次没有尺寸时借拍一张拿 px，之后一直用缓存尺寸。 */
+                px = g_lastPxSize;
+                if (px.width <= 0 || px.height <= 0) {
+                    enc = AXGrabEncodedData(&px);
+                    g_lastPxSize = px;
+                }
+            } else {
+                enc = AXGrabEncodedData(&px);
+                if (px.width > 0 && px.height > 0) g_lastPxSize = px;
+            }
+            /* ★ 截图耗时（XPC 往返 + 图片回传）此前从未统计，心跳里只看到"解"和"绘"，
+               很容易误判成采集很快。整屏截一张是 3.6MP、JPEG 约 200KB / TIFF 约 10MB，
+               这一段的耗时往往是整帧里最大的一块，必须打出来。 */
+            g_lastGrabMs = AXNowMs() - t0;
+            if (enc) g_lastImgBytes = (long long)enc.length;
+            if (!enc && g_benchMode != 3) {
+                /* 采集失败：把 AXSetErr 记的原因打出来（每 20 次打一条，别刷爆日志） */
+                static int miss = 0;
+                miss++;
+                if (miss % 20 == 1) {
+                    ALogShim(@"⚠️ 采集失败第%d次: %@  state=%ld",
+                             miss, AXAgentLastError() ?: @"?", (long)[UIApplication sharedApplication].applicationState);
+                }
+                if ((AXNowMs() - statT0) >= 5000) {
+                    ALogShim(@"❤️ 心跳 state=%ld clients=%d sent=%d 采集失败=%d vt=%p %dx%d",
+                             (long)[UIApplication sharedApplication].applicationState,
+                             g_clientCount, g_sentFrames, miss, (void *)g_vt, g_encW, g_encH);
+                    statT0 = AXNowMs();
+                }
+                usleep(30 * 1000);
+                continue;
+            }
+
+            /* 目标编码尺寸：长边 = maxSide，保持比例、对齐到偶数 */
+            int tw = g_encW, th = g_encH;
+            if (tw == 0 || th == 0 || g_encDirty) {
+                g_encDirty = 0;
+                /* ★★ 按「长边」缩放，必须与 PC 端 fitSize() 完全一致。
+                   PC 端 fitSize 就是 long = max(w,h); scale = max/long。
+                   以前这里算的是**短边**（1290x2796 + maxSide=1000 → 编成 1000x2166），
+                   而 PC 端收到后又按长边缩到 462x1000 —— 等于设备白编了 4.7 倍像素，
+                   传过来再整块丢掉，白白吃掉每帧 20~30ms（日志里「绘」偏大就是这么来的）。
+                   现在 1290x2796 + maxSide=1000 → 462x1000，两端一致，不再二次缩放。 */
+                CGFloat longSide = MAX(px.width, px.height);
+                CGFloat k = longSide > 0 ? (CGFloat)g_maxSide / longSide : 1.0;
+                if (k > 1.0) k = 1.0;
+                tw = (int)(round(px.width * k)); th = (int)(round(px.height * k));
+                tw &= ~1; th &= ~1;   /* 偶数（H.264 要求） */
+                if (tw < 16) tw = 16;
+                if (th < 16) th = 16;
+            }
+            if (!AXVTEnsure(tw, th)) { usleep(100 * 1000); continue; }
+
+            /* 只有第一次连上（或重建后）才发 session 头 + preamble */
+            if (!g_preambleSent) {
+                pthread_mutex_lock(&g_clientMu);
+                for (int i = 0; i < 4; i++) {
+                    int fd = g_clients[i];
+                    if (fd < 0) continue;
+                    AXSendPreamble(fd, tw, th, g_maxSide);
+                }
+                pthread_mutex_unlock(&g_clientMu);
+                AXSendSessionHeader(tw, th);
+                g_preambleSent = 1;
+                g_needConfig = YES;
+            }
+
+            /* ★ 静止画面检测（省电降温的关键）：
+               IPC 截出来的 JPEG 若与上一帧逐字节相同 ⇒ 屏幕真的一个像素都没变。
+               这时还按目标帧率全屏截图 + 缩放 + 编码，纯粹在烧电发热；
+               连续 4 帧不变就把帧率压到 2fps，一旦有变化（手指一动/画面一动）立刻恢复。
+               下限保 2fps：PC 侧 15 秒收不到帧会判死重连，不能真的停。 */
+            if (enc && lastEnc && enc.length == lastEnc.length &&
+                memcmp(enc.bytes, lastEnc.bytes, enc.length) == 0) {
+                if (staticStreak < 1000) staticStreak++;
+            } else {
+                staticStreak = 0;
+                lastEnc = enc;
+            }
+
+            /* 「第二步」= 解码 + 缩放 + 转成 CVPixelBuffer。2026-11-01 定案：
+               实测 档1（只截图）不烫、档2（截图 + 这一步）烫 ⇒ 热点就在这一段。
+               默认走 GPU（dec=2）：CoreImage 直接把图像渲染进像素缓冲，缩放与色彩转换由 Metal 做，
+               CPU 只剩 ImageIO 的 JPEG 熵解码（iOS 没公开的 GPU JPEG 解码接口，这段搬不走）。
+               dec=0/1 是 CPU 对照路径（全解 / thumbnail），App「解码路径」可随时切。 */
+            /* ★★ 像素缓冲：先取（只看 tw/th，跟解码无关），这样 GPU 路径可以直接往里渲染。
+               pool 复用（2026-10-31 降耗）：以前每帧 CVPixelBufferCreate 一个新 IOSurface
+               （460x1000x4 = 1.84MB），编码完再 Release —— 20fps 就是每秒 20 次
+               「内核态分配 1.84MB + 释放」，开销全算在「绘」里，还带来内存压力和调度抖动。
+               pool 用尽（VT 还没吃完）时退回直接创建，绝不因为池空而卡帧。 */
+            CVPixelBufferRef pb = NULL;
+            BOOL poolReady = (g_pbPool != NULL && g_pbPoolW == tw && g_pbPoolH == th);
+            if (poolReady) {
+                CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, g_pbPool, &pb);
+            }
+            if (!pb && !poolReady) {
+                if (g_pbPool) { CFRelease(g_pbPool); g_pbPool = NULL; g_pbPoolW = g_pbPoolH = 0; }
+                NSDictionary *poolAttrs = @{
+                    (NSString *)kCVPixelBufferPoolMinimumBufferCountKey: @(4),
+                };
+                NSDictionary *bufAttrs = @{
+                    (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
+                    (NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+                    (NSString *)kCVPixelBufferWidthKey: @(tw),
+                    (NSString *)kCVPixelBufferHeightKey: @(th),
+                };
+                if (CVPixelBufferPoolCreate(kCFAllocatorDefault,
+                                            (__bridge CFDictionaryRef)poolAttrs,
+                                            (__bridge CFDictionaryRef)bufAttrs,
+                                            &g_pbPool) == kCVReturnSuccess && g_pbPool) {
+                    g_pbPoolW = tw; g_pbPoolH = th;
+                    CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, g_pbPool, &pb);
+                }
+            }
+            if (!pb) {
+                /* 兜底：pool 不可用时仍能出帧 */
+                NSDictionary *pbAttrs = @{
+                    (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
+                    (NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+                };
+                CVPixelBufferCreate(kCFAllocatorDefault, tw, th,
+                                    kCVPixelFormatType_32BGRA,
+                                    (__bridge CFDictionaryRef)pbAttrs, &pb);
+            }
+            if (!pb) {
+                AXSetErr(-1, @"拿不到 CVPixelBuffer");
+                usleep(50 * 1000);
+                continue;
+            }
+
+            long long tDec0 = AXNowMs();
+            CGImageRef img = NULL;
+            BOOL gpuFilled = NO;
+            /* ★ GPU 路径（dec=2）：不走 ImageIO 的 CGImage 中转，CoreImage 直接渲染进 pb，
+               缩放和色彩转换都在 Metal 上做。 */
+            if (enc && g_decodeThumb == 2) {
+                gpuFilled = AXGpuBlit(enc, pb, tw, th);
+            }
+            if (enc && !gpuFilled) {
+                CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)enc, NULL);
+                if (src) {
+                    if (g_decodeThumb == 1) {
+                        NSDictionary *thumbOpts = @{
+                            (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+                            (id)kCGImageSourceCreateThumbnailWithTransform:   @NO,
+                            (id)kCGImageSourceThumbnailMaxPixelSize:          @(MAX(tw, th)),
+                            /* ★ 立刻解码：不写这个键，ImageIO 只返回懒 CGImage，
+                               真正的解码发生在后面 CGContextDrawImage 里 —— 心跳里的
+                               「解」永远显示 0ms、「绘」把解码成本也吞进去，没法定位。 */
+                            (id)kCGImageSourceShouldCacheImmediately:         @YES,
+                        };
+                        img = CGImageSourceCreateThumbnailAtIndex(src, 0,
+                                                                  (__bridge CFDictionaryRef)thumbOpts);
+                    }
+                    if (!img) {
+                        NSDictionary *fullOpts = @{
+                            (id)kCGImageSourceShouldCacheImmediately: @YES,
+                        };
+                        img = CGImageSourceCreateImageAtIndex(src, 0,
+                                                              (__bridge CFDictionaryRef)fullOpts);
+                    }
+                    CFRelease(src);
+                }
+            }
+            if (!gpuFilled && !img && g_benchMode != 3) {
+                CVPixelBufferRelease(pb);
+                usleep(20 * 1000);
+                continue;
+            }
+            long long tDec1 = AXNowMs();
+
+            if (!gpuFilled) {
+                CVPixelBufferLockBaseAddress(pb, 0);
+                void *base = CVPixelBufferGetBaseAddress(pb);
+                size_t bpr = CVPixelBufferGetBytesPerRow(pb);
+                if (!g_rgbCS) g_rgbCS = CGColorSpaceCreateDeviceRGB();
+                CGContextRef ctx = CGBitmapContextCreate(base, tw, th, 8, bpr, g_rgbCS,
+                    kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst);
+                if (ctx) {
+                    if (img) {
+                        /* ★ 缩小时用低质量插值：默认是高质量重采样（kCGInterpolationDefault），
+                           把 3.6MP 缩到 46 万像素时开销很大；投屏画面本身还要过 H.264，
+                           低插值带来的那点差别在上屏后基本不可见。 */
+                        CGContextSetInterpolationQuality(ctx, kCGInterpolationLow);
+                        CGContextDrawImage(ctx, CGRectMake(0, 0, tw, th), img);
+                    } else {
+                        /* bench=3（只测编码发送）：没有截图，无脑填黑，码率稳定、和真实静止画面接近 */
+                        memset(base, 0, bpr * (size_t)th);
+                    }
+                    CGContextRelease(ctx);
+                }
+                CVPixelBufferUnlockBaseAddress(pb, 0);
+            }
+            if (img) CGImageRelease(img);
+            /* GPU 路径下解码+缩放+落图是同一段渲染，全记在「解」里；「绘」≈0 就是它生效的标志。 */
+            g_lastDecMs  = tDec1 - tDec0;
+            g_lastDrawMs = AXNowMs() - tDec1;
+
+            /* ★ 发热定位：截图+解码+缩放都做完了，但不编码不发送 ——
+               用来把「App 端像素处理」的成本从「编码发送」里分出来。 */
+            if (g_benchMode == 2) {
+                CVPixelBufferRelease(pb);
+                statFrames++;
+                if ((AXNowMs() - statT0) >= 5000) {
+                    ALogShim(@"❤️[bench2 到缩放为止] fps=%d 图%luKB 截%lldms 解%lldms 绘%lldms 热=%s cpu=%.0f%% dec=%d",
+                             (int)(statFrames * 1000 / MAX(1, (AXNowMs() - statT0))),
+                             (unsigned long)(g_lastImgBytes / 1024), g_lastGrabMs,
+                             g_lastDecMs, g_lastDrawMs,
+                             AXThermalStateStr(), AXSelfCPUPercent(), g_decodeThumb);
+                    statT0 = AXNowMs(); statFrames = 0;
+                }
+                long long iv2 = 1000 / MAX(1, g_fps);
+                long long sp2 = AXNowMs() - t0;
+                if (iv2 > sp2) usleep((useconds_t)((iv2 - sp2) * 1000));
+                continue;
+            }
+
+            /* 不再每帧强制 IDR；新连接时 g_force_key 置位一次（照 mirror_stream v46） */
+            CFDictionaryRef fp = NULL;
+            if (g_force_key) {
+                fp = (__bridge CFDictionaryRef)@{ (NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES };
+                g_force_key = 0;
+                ALogShim(@"🎬 新连接，本帧强制 IDR");
+            }
+            CMTime pcm = CMTimeMake(AXNextPts(), 1000);
+            VTEncodeInfoFlags flags = 0;
+            OSStatus es = VTCompressionSessionEncodeFrame(g_vt, pb, pcm, kCMTimeInvalid,
+                                                          fp, NULL, &flags);
+            CVPixelBufferRelease(pb);
+            if (es != noErr) {
+                AXSetErr((int)es, [NSString stringWithFormat:@"EncodeFrame 失败 st=%d", (int)es]);
+                /* ★ -12903 = kVTInvalidSessionErr：会话被系统作废（后台收回硬编/重建失败等）。
+                   以前这里只记错误不重建，会话一废整条流就永远停住（sent 卡死）→ 现在重建。 */
+                long long nowMs = AXNowMs();
+                if (es == kVTInvalidSessionErr || es == kVTParameterErr) {
+                    ALogShim(@"❌ EncodeFrame st=%d vt=%p %dx%d 距上次丢弃 %lldms",
+                             (int)es, (void *)g_vt, g_encW, g_encH,
+                             g_vtDropAt ? (nowMs - g_vtDropAt) : -1LL);
+                    g_vtDropAt = nowMs;
+                    AXVTDrop("EncodeFrame 返回无效会话");
+                }
+                usleep(50 * 1000);
+                continue;
+            }
+
+            frameCount++;
+            statFrames++;
+            if ((AXNowMs() - statT0) >= 5000) {
+                ALogShim(@"❤️ 心跳 state=%ld clients=%d sent=%d fps=%d 图%luKB 截%lldms 解%lldms 绘%lldms 静止%d 热=%s cpu=%.0f%% bench=%d dec=%d vt=%p %dx%d tap[间隔=%lldms 确认=%lldms %d/%d err=%d]",
+                         (long)[UIApplication sharedApplication].applicationState,
+                         g_clientCount, g_sentFrames,
+                         (int)(statFrames * 1000 / MAX(1, (AXNowMs() - statT0))),
+                         (unsigned long)(g_lastImgBytes / 1024),
+                         g_lastGrabMs, g_lastDecMs, g_lastDrawMs, staticStreak,
+                         AXThermalStateStr(), AXSelfCPUPercent(), g_benchMode, g_decodeThumb,
+                         (void *)g_vt, g_encW, g_encH,
+                         g_tapGapMs, g_tapCfmMs, g_tapCfmN, g_tapSynN, g_tapCfmErr);
+                statT0 = AXNowMs(); statFrames = 0;
+            }
+
+            /* 节奏控制（2026-10-31 改）：按「下一帧的绝对时刻」排程。
+               旧写法 sleep(预算 - 本帧耗时) 会把抖动一点点累积，实测帧率比目标低 10~20%；
+               而且一旦某帧超预算就完全不等，等于放开跑、把带宽打满。 */
+            /* ★ 输入唤醒：只要收到触控（g_inputKick），本轮**跳过节拍等待**、立刻抓下一帧。
+               ★★ 2026-10-31 修：以前这里只写 nextTick = AXNowMs()，可下面紧接着就是
+               nextTick += intervalMs，等于「设成现在」再「加 50ms」—— 照样睡满一整帧，
+               这个唤醒从加上那天起就没生效过。以前静止降帧到 2fps 时，500ms 的大头
+               把这点 50ms 盖住了，所以一直没人发现。 */
+            BOOL kickNow = NO;
+            if (g_inputKick) {
+                g_inputKick = 0;
+                staticStreak = 0;
+                kickNow = YES;
+            }
+
+            int fpsNow = (g_fps > 0 ? g_fps : 20);
+            if (fpsNow > 60) fpsNow = 60;
+            if (fpsNow < 1)  fpsNow = 1;
+            /* 画面静止超过 4 帧 → 降到 g_staticFps（只发心跳帧维持会话）；有变化立刻回到目标帧率 */
+            if (g_staticDrop && staticStreak >= 4 && fpsNow > g_staticFps) fpsNow = g_staticFps;
+            long long intervalMs = 1000 / fpsNow;
+            nextTick += intervalMs;
+            long long nowPace = AXNowMs();
+            if (kickNow) {
+                /* 不睡：这一帧就是被输入唤醒的，晚一帧用户就多一帧的等待。
+                   nextTick 对齐到现在，避免下一轮补帧连发。 */
+                nextTick = nowPace;
+            }
+            if (nextTick > nowPace) {
+                /* 分段睡：中间一旦有触控就提前醒来，别死等满一整帧间隔 */
+                long long remain = nextTick - nowPace;
+                while (remain > 0 && g_running) {
+                    if (g_inputKick) {
+                        g_inputKick = 0;
+                        staticStreak = 0;
+                        nextTick = AXNowMs();
+                        break;
+                    }
+                    long long stepMs = remain > 8 ? 8 : remain;
+                    usleep((useconds_t)(stepMs * 1000));
+                    remain -= stepMs;
+                }
+            } else if (nowPace - nextTick > intervalMs * 3) {
+                nextTick = nowPace;      /* 落后超过 3 帧就不追，免得补帧连发 */
+            }
+        }
+    }
+    ALogShim(@"🎬 编码循环退出（共 %d 帧）", frameCount);
+    return NULL;
+}
+
+/* ---------------- 监听 ---------------- */
+
+static void *AXAcceptLoop(void *arg) {
+    (void)arg;
+    ALogShim(@"📡 accept 循环启动");
+    while (g_running) {
+        struct sockaddr_in addr;
+        socklen_t alen = sizeof(addr);
+        int fd = accept(g_listenFd, (struct sockaddr *)&addr, &alen);
+        if (fd < 0) {
+            if (errno == EINTR) continue;
+            if (!g_running) break;
+            usleep(50 * 1000);
+            continue;
+        }
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        /* 发送超时 200ms：PC 端读得慢时宁可丢这个客户端，也不能把编码线程卡死 */
+        struct timeval sndTo;
+        sndTo.tv_sec = 0;
+        sndTo.tv_usec = 200 * 1000;
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sndTo, sizeof(sndTo));
+        char ip[64] = {0};
+        inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
+        AXMarkPCActive(ip);
+        ALogShim(@"📡 电脑已连接视频流 %s", ip);
+
+        pthread_mutex_lock(&g_clientMu);
+        int slot = -1;
+        for (int i = 0; i < 4; i++) if (g_clients[i] < 0) { slot = i; break; }
+        if (slot < 0) {
+            pthread_mutex_unlock(&g_clientMu);
+            close(fd);
+            ALogShim(@"📡 客户端已满，拒绝 %s", ip);
+            continue;
+        }
+        g_clients[slot] = fd;
+        g_clientCount++;
+        pthread_mutex_unlock(&g_clientMu);
+
+        /* 已有编码尺寸就直接发 preamble；没有就等编码循环第一帧算出来再发
+           （★ 之前这里用 maxSide 硬凑 720x1560，和真实编码尺寸 332x720 不符 → 黑屏） */
+        if (g_encW > 0 && g_encH > 0) {
+            AXSendPreamble(fd, g_encW, g_encH, g_maxSide);
+            AXSendSessionHeader(g_encW, g_encH);
+            g_needConfig = YES;   /* 新客户端要重新收一份 SPS/PPS */
+            g_force_key = 1;      /* ★ 新连接强制下一帧 IDR（照 mirror_stream v46） */
+            g_preambleSent = 1;
+        }
+    }
+    ALogShim(@"📡 accept 循环退出");
+    return NULL;
+}
+
+/* ---------------- 对外接口 ---------------- */
+
+static void AXLoadStoredUDIDIfNeeded(void);
+
+/* ---------------- 后台常驻 ----------------
+   现象：App 一退到后台，27184 的 H.264 流就断。
+   原因：iOS 把 App 挂起（suspend），socket/线程全部冻结，不是我们代码断了。
+   做法（行业通用）：声明 UIBackgroundModes=audio + 播一段静音循环，系统就认为
+   "还在播音频"而保持进程活着；另外再挂一个 beginBackgroundTask 兜底（给非音频阶段争取时间）。
+   代价：后台常驻会多耗一点电。 */
+static AVAudioPlayer *g_keepAlivePlayer = nil;
+static UIBackgroundTaskIdentifier g_bgTask = UIBackgroundTaskInvalid;
+static volatile int g_keepAliveOn = 0;
+
+/* 1 秒 44.1k/16bit/单声道静音 WAV */
+static NSData *AXSilentWav(void) {
+    const int rate = 44100, secs = 1, ch = 1, bits = 16;
+    const int dataLen = rate * secs * ch * bits / 8;
+    NSMutableData *d = [NSMutableData data];
+    uint8_t hdr[44];
+    memcpy(hdr, "RIFF", 4);
+    uint32_t v = 36 + dataLen; memcpy(hdr + 4, &v, 4);
+    memcpy(hdr + 8, "WAVEfmt ", 8);
+    v = 16; memcpy(hdr + 16, &v, 4);
+    uint16_t s16 = 1; memcpy(hdr + 20, &s16, 2);       /* PCM */
+    s16 = ch;         memcpy(hdr + 22, &s16, 2);
+    v = rate;         memcpy(hdr + 24, &v, 4);
+    v = rate * ch * bits / 8; memcpy(hdr + 28, &v, 4);
+    s16 = ch * bits / 8; memcpy(hdr + 32, &s16, 2);
+    s16 = bits;       memcpy(hdr + 34, &s16, 2);
+    memcpy(hdr + 36, "data", 4);
+    v = dataLen;      memcpy(hdr + 40, &v, 4);
+    [d appendBytes:hdr length:44];
+    [d appendBytes:calloc(1, dataLen) length:dataLen];
+    return d;
+}
+
+/* 应用前后台切换打点与后台任务自动续期 */
+static void AXInstallLifecycleLog(void) {
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    void (^logState)(NSString *) = ^(NSString *tag) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ALogShim(@"📱 生命周期: %@  state=%ld  clients=%d  frames=%d",
+                     tag, (long)[UIApplication sharedApplication].applicationState,
+                     g_clientCount, g_sentFrames);
+            if (g_keepAliveUserEnabled && g_keepAlivePlayer && ![g_keepAlivePlayer isPlaying]) {
+                [[AVAudioSession sharedInstance] setActive:YES error:nil];
+                [g_keepAlivePlayer play];
+            }
+        });
+    };
+    [nc addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:nil
+                 usingBlock:^(NSNotification *n) { logState(@"willResignActive"); }];
+    [nc addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:nil
+                 usingBlock:^(NSNotification *n) { logState(@"didEnterBackground"); }];
+    [nc addObserverForName:UIApplicationWillEnterForegroundNotification object:nil queue:nil
+                 usingBlock:^(NSNotification *n) { logState(@"willEnterForeground"); }];
+    [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:nil
+                 usingBlock:^(NSNotification *n) { logState(@"didBecomeActive"); }];
+}
+
+static void AXStartKeepAlive(void) {
+    if (!g_keepAliveUserEnabled) return;
+    if (g_keepAliveOn) return;
+    g_keepAliveOn = 1;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (g_bgTask == UIBackgroundTaskInvalid) {
+            g_bgTask = [[UIApplication sharedApplication]
+                        beginBackgroundTaskWithName:@"AXRemote2KeepAlive"
+                        expirationHandler:^{
+                if (g_keepAlivePlayer) {
+                    [[AVAudioSession sharedInstance] setActive:YES error:nil];
+                    [g_keepAlivePlayer play];
+                }
+            }];
+        }
+        NSError *e1 = nil, *e2 = nil;
+        AVAudioSession *s = [AVAudioSession sharedInstance];
+        [s setCategory:AVAudioSessionCategoryPlayback
+           withOptions:AVAudioSessionCategoryOptionMixWithOthers
+                 error:&e1];
+        [s setActive:YES error:&e2];
+        if (!g_keepAlivePlayer) {
+            NSError *e3 = nil;
+            g_keepAlivePlayer = [[AVAudioPlayer alloc] initWithData:AXSilentWav() error:&e3];
+            g_keepAlivePlayer.numberOfLoops = -1;
+            g_keepAlivePlayer.volume = 0.01;
+        }
+        BOOL ok = [g_keepAlivePlayer play];
+        ALogShim(@"🔋 远控2 后台常驻已开启（静音音频保活=%d，无定位弹窗）", ok);
+    });
+}
+
+static void AXStopKeepAlive(void) {
+    if (!g_keepAliveOn) return;
+    g_keepAliveOn = 0;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (g_keepAlivePlayer) { [g_keepAlivePlayer stop]; }
+        if (g_bgTask != UIBackgroundTaskInvalid) {
+            [[UIApplication sharedApplication] endBackgroundTask:g_bgTask];
+            g_bgTask = UIBackgroundTaskInvalid;
+        }
+        ALogShim(@"🔋 远控2 后台常驻已关闭");
+    });
+}
+
+/* ---------------- 采集方案 B：ReplayKit ----------------
+   RPScreenRecorder 直接给 CMSampleBuffer（像素已在内存里，不用解码），喂给 VT 即可，
+   比 XCUITest 少一次"编码数据→解码→转 BGRA"。
+   代价：状态栏出现录屏标识；个别内容（DRM 视频）拿不到 → 由看门狗回退 XCUITest。 */
+/* ---------- 测试档位表（临时脚手架：测完删掉这一段 + UI 里的动态菜单即可） ----------
+   每个档位 = 采集方式 + 截图编码格式 + 压缩质量。
+   用途：一次装机把「JPEG/PNG/TIFF/录屏」四种拿流方式全测一遍，看 图·解·绘·fps 四组数字。 */
+typedef struct {
+    const char *name;
+    int         capture;   /* 0=系统截图(XCUITest IPC)  1=系统录屏(ReplayKit) */
+    const char *uti;       /* 截图编码格式 */
+    double      quality;   /* 压缩质量 */
+} AXTestProfile;
+
+static const AXTestProfile kAXProfiles[] = {
+    /* ★★ 2026-10-31：TIFF 档彻底移除。原因：
+       TIFF 是未压缩位图，整屏一张 10567KB，daemon 编码 + XPC 回传实测能到 2299ms/帧，
+       用户一直以为"卡"是别的毛病，其实就在这。
+       ★ 更要命的是档位会存进 NSUserDefaults（kAXSchemeKey），每次「重启投屏服务」
+       都按存下来的索引重新应用一次 —— 用户早先点过一次 TIFF，之后就一直恢复成 TIFF，
+       手动用 quality 命令改成 JPEG 也会被下一次重启覆盖掉。
+       这里保持索引数量不变（避免历史存档越界），但把 TIFF 位置换成 JPEG 0.70。 */
+    { "系统截图 · JPEG 0.10（默认）", 0, "public.jpeg", 0.10 },
+    { "系统截图 · JPEG 0.40",        0, "public.jpeg", 0.40 },
+    { "系统截图 · JPEG 0.70",        0, "public.jpeg", 0.70 },
+    { "系统截图 · PNG 无损",          0, "public.png",  1.00 },
+    { "系统录屏",                     1, "public.jpeg", 0.70 },
+};
+
+int AXStreamProfileCount(void) {
+    return (int)(sizeof(kAXProfiles) / sizeof(kAXProfiles[0]));
+}
+
+const char *AXStreamProfileName(int idx) {
+    if (idx < 0 || idx >= AXStreamProfileCount()) return "";
+    return kAXProfiles[idx].name;
+}
+
+int AXStreamProfileCapture(int idx) {
+    if (idx < 0 || idx >= AXStreamProfileCount()) return 0;
+    return kAXProfiles[idx].capture;
+}
+
+const char *AXStreamProfileDesc(int idx) {
+    if (idx < 0 || idx >= AXStreamProfileCount()) return "";
+    static char buf[160];
+    const AXTestProfile *p = &kAXProfiles[idx];
+    snprintf(buf, sizeof(buf), "采集=%s 格式=%s q=%.2f",
+             p->capture ? "录屏" : "截图", p->uti, p->quality);
+    return buf;
+}
+
+/* 应用档位：编码参数（格式/质量）每帧读取 → 立即生效；
+   采集方式（截图↔录屏）需要重启投屏服务才切换。 */
+void AXStreamApplyProfile(int idx) {
+    if (idx < 0 || idx >= AXStreamProfileCount()) return;
+    const AXTestProfile *p = &kAXProfiles[idx];
+    /* ★ 只记"想要哪种采集"，不直接改 g_scheme：否则选「录屏」的瞬间编码循环就停了截图，
+       而 ReplayKit 只在 Start 里启动 → 中间画面会冻住。真正切换发生在 AXStreamStart。 */
+    g_profileCapture = (p->capture == 1) ? 1 : 0;
+    g_rkFallback = 0;
+    memset(g_imgUTI, 0, sizeof(g_imgUTI));
+    size_t n = strlen(p->uti);
+    if (n >= sizeof(g_imgUTI)) n = sizeof(g_imgUTI) - 1;
+    memcpy(g_imgUTI, p->uti, n);
+    g_imgQuality = p->quality;
+    ALogShim(@"🎛 档位[%d] %s（%s）", idx, p->name, AXStreamProfileDesc(idx));
+}
+
+void AXStreamSetScheme(int s) { g_scheme = (s == 1) ? 1 : 0; g_rkFallback = 0; }
+int  AXStreamGetScheme(void) { return g_scheme; }
+/* 供界面显示：0=XCUITest 1=ReplayKit 2=ReplayKit 失败已回退 */
+int  AXStreamActiveScheme(void) { return g_rkFallback ? 2 : g_scheme; }
+
+static void AXReplayKitStopInternal(void) {
+    RPScreenRecorder *r = [RPScreenRecorder sharedRecorder];
+    if (r.isRecording) {
+        [r stopCaptureWithHandler:^(NSError *e) {
+            ALogShim(@"🛑 ReplayKit 已停止（%@）", e ? e.localizedDescription : @"ok");
+        }];
+    }
+}
+
+static void AXReplayKitHandler(CMSampleBufferRef sbuf, RPSampleBufferType type, NSError *err) {
+    if (type != RPSampleBufferTypeVideo) return;
+    if (err) { ALogShim(@"❌ ReplayKit 帧错误: %@", err.localizedDescription); return; }
+    CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sbuf);
+    if (!pb) return;
+    int w = (int)CVPixelBufferGetWidth(pb);
+    int h = (int)CVPixelBufferGetHeight(pb);
+    if (w <= 0 || h <= 0) return;
+    if (!AXVTEnsureWithFormat(w, h, CVPixelBufferGetPixelFormatType(pb))) return;
+
+    if (!g_preambleSent) {
+        pthread_mutex_lock(&g_clientMu);
+        for (int i = 0; i < 4; i++) {
+            if (g_clients[i] >= 0) AXSendPreamble(g_clients[i], w, h, g_maxSide);
+        }
+        pthread_mutex_unlock(&g_clientMu);
+        AXSendSessionHeader(w, h);
+        g_preambleSent = 1;
+        ALogShim(@"📺 [RK] preamble 已发 %dx%d", w, h);
+    }
+    OSStatus es = VTCompressionSessionEncodeFrame(g_vt, pb,
+                                    CMSampleBufferGetPresentationTimeStamp(sbuf),
+                                    kCMTimeInvalid, NULL, NULL, NULL);
+    if (es != noErr) {
+        ALogShim(@"❌ [RK] EncodeFrame 失败 st=%d → 丢弃会话重建", (int)es);
+        AXVTDrop("ReplayKit 编码失败");
+        return;
+    }
+    AXCacheFramePB(pb);
+    g_lastFrameAtMs = AXNowMs();
+    g_rkFrames++;
+}
+
+/* 看门狗：3 秒没出帧就认定"这一路拿不到画面"，自动回退到 XCUITest 截图。
+   覆盖：权限没给、isAvailable=NO、DRM 内容、系统限制等。 */
+static void *AXReplayKitWatchdog(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 50; i++) {          /* ★ 用户要求放宽到 5 秒 */
+        usleep(100 * 1000);
+        if (!g_running || g_scheme != 1) return NULL;
+        if (g_rkFrames > 0) return NULL;
+    }
+    if (gSession != nil) {
+        ALogShim(@"⚠️ ReplayKit 5 秒内没有出帧 → 自动回退 XCUITest 截图方案");
+        AXReplayKitStopInternal();
+        g_scheme = 0;
+        g_rkFallback = 1;
+    } else {
+        ALogShim(@"ℹ️ ReplayKit 等待画面变化或授权中（保持 ReplayKit + 静态帧保活模式）");
+    }
+    return NULL;
+}
+
+static BOOL AXReplayKitStart(void) {
+    RPScreenRecorder *r = [RPScreenRecorder sharedRecorder];
+    if (!r.isAvailable) {
+        ALogShim(@"❌ ReplayKit 不可用（isAvailable=NO）→ 回退 XCUITest");
+        g_rkFallback = 1;
+        g_scheme = 0;
+        return NO;
+    }
+    r.microphoneEnabled = NO;
+    g_rkFrames = 0;
+    [r startCaptureWithHandler:^(CMSampleBufferRef sbuf, RPSampleBufferType t, NSError *e) {
+        @autoreleasepool { AXReplayKitHandler(sbuf, t, e); }
+    } completionHandler:^(NSError *e) {
+        if (e) {
+            ALogShim(@"❌ ReplayKit 启动失败: %@ → 回退 XCUITest", e.localizedDescription);
+            g_rkFallback = 1;
+            g_scheme = 0;
+        } else {
+            ALogShim(@"✅ ReplayKit 采集已启动（等首帧）");
+        }
+    }];
+    pthread_t tid;
+    pthread_create(&tid, NULL, AXReplayKitWatchdog, NULL);
+    pthread_detach(tid);
+    return YES;
+}
+
+/* 运行期应用画质参数（PC 的 0x40 走这里，10010 的 fps 命令也走这里）。
+   - fps：立刻影响编码循环的排程
+   - bitrate：直接改现有 VT 会话的 ABR 目标，不重建
+   - maxSide：分辨率变了必须重建编码会话（下一帧自动建），并强制一个关键帧
+   ★ 不重发 preamble：PC 侧解码器是从 SPS 里读新尺寸的（rebuild 由 dec.FrameSize() 触发），
+     往已建的流里再发一遍 preamble 会把 PC 的包解析打乱（就是 10-31 那次闪退）。 */
+static void AXApplyVideoParams(uint32_t fps, uint32_t bitrateBps, uint32_t maxSide) {
+    if (fps > 0) {
+        g_fps = (int)fps;
+        if (g_vt) {
+            VTSessionSetProperty(g_vt, kVTCompressionPropertyKey_ExpectedFrameRate,
+                                 (__bridge CFNumberRef)@(g_fps));
+        }
+    }
+    if (bitrateBps > 0) {
+        g_bitrate = (int)bitrateBps;
+        if (g_vt) {
+            VTSessionSetProperty(g_vt, kVTCompressionPropertyKey_AverageBitRate,
+                                 (__bridge CFNumberRef)@(g_bitrate));
+        }
+    }
+    if (maxSide > 0 && (int)maxSide != g_maxSide) {
+        g_maxSide = (int)maxSide;
+        g_force_key = 1;
+        /* ★ 必须让主循环重算编码尺寸：主循环是「tw = g_encW; 只有 tw==0 才按 maxSide 重算」，
+           不标脏的话下一帧照样拿旧尺寸去 AXVTEnsure（还会命中 early-return），调 maxSide 等于没调。 */
+        g_encDirty = 1;
+        AXVTDrop("分辨率变更");
+    }
+    ALogShim(@"🎚 画质参数 fps=%d  %dkbps  maxSide=%d", g_fps, g_bitrate / 1000, g_maxSide);
+}
+
+#pragma mark - 7. 控制通道 27185（scrcpy 二进制消息 + AES-256-CTR）
+
+/* 与 PC 端 internal/iosscreen 的约定（v46.17 起）：
+   - 视频 27184 明文；控制 27185 建连后 PC 先发 16B 明文 nonce，
+     之后双向 AES-256-CTR：IV=nonce，末字节 bit0=0 → PC→设备，=1 → 设备→PC。
+   - 消息：0x00 按键(14B) / 0x01 文本(5+n) / 0x02 触控(32B) / 0x03 滚动(21B)
+           / 0x04 返回(2B) / 0x09 剪贴板(14+n)
+   - 触控 x/y 是「画面像素」坐标，w/h 同一坐标系 → 这里换算回屏幕点数（XCUITest 用点）。 */
+static const uint8_t kAXCtrlKey[32] = {
+    0x7c, 0x1e, 0x93, 0xa5, 0xd4, 0x48, 0xf0, 0xb2, 0x6a, 0xc9, 0x51, 0xe7,
+    0x33, 0x8d, 0x02, 0xf5, 0xb8, 0x64, 0x1d, 0x9a, 0xc0, 0x27, 0xfe, 0x73,
+    0x59, 0xe1, 0x8b, 0x46, 0xd3, 0xaa, 0x90, 0x6c,
+};
+
+static int      g_ctrlListen = -1;
+static volatile int g_ctrlRun = 0;
+static CCCryptorRef g_ccDec = NULL;   /* PC → 设备 */
+static CCCryptorRef g_ccEnc = NULL;   /* 设备 → PC */
+
+static inline uint32_t AXBE32(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+static inline uint16_t AXBE16(const uint8_t *p) {
+    return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
+}
+
+static BOOL AXCryptoInit(const uint8_t *nonce16) {
+    if (g_ccDec) { CCCryptorRelease(g_ccDec); g_ccDec = NULL; }
+    if (g_ccEnc) { CCCryptorRelease(g_ccEnc); g_ccEnc = NULL; }
+    uint8_t iv0[16], iv1[16];
+    memcpy(iv0, nonce16, 16); iv0[15] &= (uint8_t)~1;
+    memcpy(iv1, nonce16, 16); iv1[15] |= 1;
+    /* AES-CTR 两向都是「异或同一密钥流」，所以两个方向都用 kCCEncrypt 建上下文 */
+    CCCryptorStatus s1 = CCCryptorCreateWithMode(kCCEncrypt, kCCModeCTR,
+        kCCAlgorithmAES, ccNoPadding, iv0, kAXCtrlKey, 32,
+        NULL, 0, 0, kCCModeOptionCTR_BE, &g_ccDec);
+    CCCryptorStatus s2 = CCCryptorCreateWithMode(kCCEncrypt, kCCModeCTR,
+        kCCAlgorithmAES, ccNoPadding, iv1, kAXCtrlKey, 32,
+        NULL, 0, 0, kCCModeOptionCTR_BE, &g_ccEnc);
+    if (s1 != kCCSuccess || s2 != kCCSuccess) {
+        ALog(@"❌ 控制通道 AES 初始化失败 %d/%d", (int)s1, (int)s2);
+        return NO;
+    }
+    return YES;
+}
+
+static void AXCryptInPlace(CCCryptorRef cc, void *buf, size_t len) {
+    if (!cc || len == 0) return;
+    uint8_t *tmp = (uint8_t *)malloc(len);
+    if (!tmp) return;
+    size_t moved = 0;
+    if (CCCryptorUpdate(cc, buf, len, tmp, len, &moved) == kCCSuccess && moved == len) {
+        memcpy(buf, tmp, len);
+    }
+    free(tmp);
+}
+
+static BOOL AXReadExactRaw(int fd, void *buf, size_t want) {
+    size_t got = 0;
+    while (got < want) {
+        if (!g_ctrlRun) return NO;
+        ssize_t n = read(fd, (uint8_t *)buf + got, want - got);
+        if (n > 0) { got += (size_t)n; continue; }
+        /* ★ 控制通道大部分时间是空闲的：SO_RCVTIMEO 到点返回 EAGAIN 属正常，
+           绝不能被当成"断开"（否则 PC 手一停，控制口就自己掉了） */
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) continue;
+        return NO;
+    }
+    return YES;
+}
+
+/* 读 want 字节并解密 */
+static BOOL AXReadDec(int fd, void *buf, size_t want) {
+    if (want == 0) return YES;
+    if (!AXReadExactRaw(fd, buf, want)) return NO;
+    AXCryptInPlace(g_ccDec, buf, want);
+    return YES;
+}
+
+/* 读掉 n 字节（仍要解密，否则密钥流位置会错） */
+static BOOL AXSkipBytes(int fd, uint32_t n) {
+    uint8_t tmp[256];
+    while (n > 0) {
+        size_t c = (n > sizeof(tmp)) ? sizeof(tmp) : n;
+        if (!AXReadDec(fd, tmp, c)) return NO;
+        n -= (uint32_t)c;
+    }
+    return YES;
+}
+
+/* ---------- 触摸聚合：PC 发的是 down/move/up 流，XCTest 要的是「一条完整轨迹」 ---------- */
+#define AX_TP_MAX 160
+typedef struct { double x, y, t; } AXTouchPt;
+
+static AXTouchPt g_tpts[2][AX_TP_MAX];
+static int       g_tpn[2];
+static int64_t   g_tpId[2];
+static BOOL      g_tpUsed[2];
+static BOOL      g_tpDone[2];   /* 这根手指是否已抬起（两根都抬起才提交） */
+static double    g_tpT0;
+
+static void AXTouchReset(void) {
+    g_tpn[0] = g_tpn[1] = 0;
+    g_tpUsed[0] = g_tpUsed[1] = NO;
+    g_tpDone[0] = g_tpDone[1] = NO;
+    g_tpId[0] = g_tpId[1] = 0;
+    g_tpT0 = 0;
+}
+
+static double AXNowSec(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + tv.tv_usec / 1000000.0;
+}
+
+/* 把攒下的轨迹一次性合成提交：1 指=点/滑动，2 指=任意双指手势 */
+static void AXTouchCommit(void) {
+    int nUsed = (g_tpUsed[0] ? 1 : 0) + (g_tpUsed[1] ? 1 : 0);
+    if (nUsed <= 0) { AXTouchReset(); return; }
+
+    if (nUsed == 1) {
+        int s = g_tpUsed[0] ? 0 : 1;
+        int k = g_tpn[s];
+        if (k <= 0) { AXTouchReset(); return; }
+        if (k <= 2) {
+            /* ★★★ b92：**投屏的点击是从这里进的**（PC 发 DOWN/MOVE/UP 分片 → AXTouchCommit），
+               不经过 AXAgentTap —— b91 把 HID 开关接在了 AXAgentTap 上，所以一直没生效。
+               单点判定（k<=2）就按一下，直接走 HID，0ms 且不受 XCTest 确认拖累。 */
+            if (g_hidTapOn != 0 && AXAgentHIDTap(g_tpts[s][0].x, g_tpts[s][0].y)) {
+                /* 日志由 AXAgentHIDTap 打，这里不重复 */
+            } else {
+                AXTapCore(g_tpts[s][0].x, g_tpts[s][0].y);
+            }
+        } else {
+            double xy[AX_TP_MAX * 2];
+            double tt[AX_TP_MAX];
+            for (int i = 0; i < k; i++) {
+                xy[i * 2]     = g_tpts[s][i].x;
+                xy[i * 2 + 1] = g_tpts[s][i].y;
+                tt[i]         = g_tpts[s][i].t;
+            }
+            AXGestureCore(xy, tt, k);
+        }
+        AXTouchReset();
+        return;
+    }
+
+    /* 双指：同一个 record 里挂两条 path */
+    @try {
+        Class pathCls = NSClassFromString(@"XCPointerEventPath");
+        Class recCls  = NSClassFromString(@"XCSynthesizedEventRecord");
+        if (!pathCls || !recCls) { AXTouchReset(); return; }
+        SEL initRec = NSSelectorFromString(@"initWithName:interfaceOrientation:");
+        id rec = ((id (*)(id, SEL, id, long))objc_msgSend)([recCls alloc], initRec,
+                                                           @"AXAgent", AXInterfaceOrientation());
+        if (!rec) { AXTouchReset(); return; }
+
+        SEL initPath = NSSelectorFromString(@"initForTouchAtPoint:offset:");
+        SEL mv       = NSSelectorFromString(@"moveToPoint:atOffset:");
+        SEL up       = NSSelectorFromString(@"liftUpAtOffset:");
+        SEL addPath  = NSSelectorFromString(@"addPointerEventPath:");
+
+        for (int s = 0; s < 2; s++) {
+            if (!g_tpUsed[s] || g_tpn[s] <= 0) continue;
+            id path = ((id (*)(id, SEL, CGPoint, double))objc_msgSend)(
+                          [pathCls alloc], initPath,
+                          CGPointMake(g_tpts[s][0].x, g_tpts[s][0].y), 0.0);
+            if (!path) continue;
+            for (int i = 1; i < g_tpn[s]; i++) {
+                ((void (*)(id, SEL, CGPoint, double))objc_msgSend)(
+                    path, mv, CGPointMake(g_tpts[s][i].x, g_tpts[s][i].y), g_tpts[s][i].t);
+            }
+            ((void (*)(id, SEL, double))objc_msgSend)(path, up, g_tpts[s][g_tpn[s] - 1].t);
+            ((void (*)(id, SEL, id))objc_msgSend)(rec, addPath, path);
+        }
+
+        if (!AXSubmitEventRecord(rec, 0.05)) ALog(@"❌ 双指事件提交失败");
+    } @catch (NSException *e) {
+        ALog(@"❌ 双指事件异常: %@", e.reason);
+    }
+    AXTouchReset();
+    /* ★ daemon 是串行的：截图和 synthesizeEvent 走同一条队列。
+       我们每秒打 20 次截图（每次 25-60ms），合成事件排在后面 → 表现为"点了要等一会才生效"。
+       这里在提交完手势后短暂停采，把队列让给合成事件。 */
+    if (g_capPauseMs > 0) g_capPauseUntil = AXSeqMs() + g_capPauseMs;
+}
+
+static void AXTouchHandle(const uint8_t *b) {
+    /* ★ 延迟诊断：相邻两条触控消息的到达间隔。若这里就 >500ms，说明慢在 PC 侧发送，
+       不怪我们；若间隔很小但动作不生效，那问题在我们合成/系统处理。 */
+    {
+        static long long lastMs = 0;
+        long long now = AXSeqMs();
+        if (lastMs > 0) {
+            long long dt = now - lastMs;
+            if (dt > 300) ALog(@"⏱ 触控到达间隔 %lldms（action=%d）", dt, b[0]);
+        }
+        lastMs = now;
+    }
+    g_inputKick = 1;      /* 手指一动就让编码循环马上抓一帧（静止降帧时否则要等 0.5s 才有反馈） */
+    int     action = b[0];
+    int64_t pid    = 0;
+    for (int i = 0; i < 8; i++) pid = (pid << 8) | b[1 + i];
+    double  x = AXBE32(b + 9), y = AXBE32(b + 13);
+    int     w = AXBE16(b + 17), h = AXBE16(b + 19);
+
+    CGSize pts = [UIScreen mainScreen].bounds.size;
+    double sx = (w > 0) ? pts.width / (double)w : 1.0;
+    double sy = (h > 0) ? pts.height / (double)h : 1.0;
+    double px = x * sx, py = y * sy;
+
+    if (action == 3) { AXTouchReset(); return; }   /* cancel */
+
+    int slot = -1;
+    for (int i = 0; i < 2; i++) {
+        if (g_tpUsed[i] && g_tpId[i] == pid) { slot = i; break; }
+    }
+    if (slot < 0) {
+        for (int i = 0; i < 2; i++) {
+            if (!g_tpUsed[i]) {
+                slot = i; g_tpUsed[i] = YES; g_tpDone[i] = NO; g_tpId[i] = pid; g_tpn[i] = 0;
+                break;
+            }
+        }
+    }
+    if (slot < 0) return;                          /* 只支持 2 指 */
+
+    if (g_tpT0 == 0) g_tpT0 = AXNowSec();
+    double t = AXNowSec() - g_tpT0;
+    if (t > 5.0) t = 5.0;
+
+    if (action == 0 || action == 2) {
+        if (g_tpn[slot] < AX_TP_MAX) {
+            g_tpts[slot][g_tpn[slot]].x = px;
+            g_tpts[slot][g_tpn[slot]].y = py;
+            g_tpts[slot][g_tpn[slot]].t = t;
+            g_tpn[slot]++;
+        }
+        if (action == 0) g_tpUsed[slot] = YES;
+    } else if (action == 1) {                      /* up：补齐末点并结束这一指 */
+        if (g_tpn[slot] < AX_TP_MAX) {
+            g_tpts[slot][g_tpn[slot]].x = px;
+            g_tpts[slot][g_tpn[slot]].y = py;
+            g_tpts[slot][g_tpn[slot]].t = t;
+            g_tpn[slot]++;
+        }
+        g_tpDone[slot] = YES;
+        /* 所有在按的手指都抬起了才提交；还有一根按着就继续等它 */
+        BOOL anyActive = NO;
+        for (int i = 0; i < 2; i++) {
+            if (g_tpUsed[i] && !g_tpDone[i]) anyActive = YES;
+        }
+        if (!anyActive) AXTouchCommit();
+    }
+}
+
+static void AXCtrlKeycode(uint32_t kc) {
+    switch (kc) {
+        case 3:   AXAgentPressHome();           break;   /* Home */
+        case 4:   AXAgentPressHome();           break;   /* Back → iOS 无返回键，等价 Home */
+        case 66:  AXAgentKey(@"\r", 0);         break;   /* Enter */
+        case 67:  AXAgentKey(@"\b", 0);         break;   /* Del/退格 */
+        default:  ALog(@"  ⌨️ 未映射的 keycode=%u（忽略）", kc); break;
+    }
+}
+
+static void AXCtrlHandleClient(int fd) {
+    uint8_t nonce[16];
+    if (!AXReadExactRaw(fd, nonce, 16)) { close(fd); return; }
+    if (!AXCryptoInit(nonce)) { close(fd); return; }
+    ALog(@"🎛 控制通道已连接（AES-CTR 已就绪）");
+
+    BOOL alive = YES;
+    while (g_ctrlRun && alive) {
+        uint8_t t = 0;
+        if (!AXReadDec(fd, &t, 1)) { alive = NO; break; }
+
+        if (t == 0x00) {                       /* 按键 14B */
+            uint8_t b[13];
+            if (!AXReadDec(fd, b, 13)) { alive = NO; break; }
+            if (b[0] == 0) AXCtrlKeycode(AXBE32(b + 1));   /* 只处理按下，避免重复 */
+        } else if (t == 0x01) {                /* 文本 5+n */
+            uint8_t lb[4];
+            if (!AXReadDec(fd, lb, 4)) { alive = NO; break; }
+            uint32_t n = AXBE32(lb);
+            if (n == 0 || n > 8192) { alive = NO; break; }
+            uint8_t *tb = (uint8_t *)malloc(n);
+            if (!tb) { alive = NO; break; }
+            if (!AXReadDec(fd, tb, n)) { free(tb); alive = NO; break; }
+            NSString *str = [[NSString alloc] initWithBytes:tb length:n encoding:NSUTF8StringEncoding];
+            free(tb);
+            if (str.length) AXAgentTypeText(str);
+        } else if (t == 0x02) {                /* 触控 32B */
+            uint8_t b[31];
+            if (!AXReadDec(fd, b, 31)) { alive = NO; break; }
+            AXTouchHandle(b);
+        } else if (t == 0x03) {                /* 滚动 21B → 映射成滑动 */
+            uint8_t b[20];
+            if (!AXReadDec(fd, b, 20)) { alive = NO; break; }
+            double x = AXBE32(b + 0), y = AXBE32(b + 4);
+            int    w = AXBE16(b + 8), h = AXBE16(b + 10);
+            int16_t hs = (int16_t)AXBE16(b + 12);
+            int16_t vs = (int16_t)AXBE16(b + 14);
+            CGSize pts = [UIScreen mainScreen].bounds.size;
+            double px = (w > 0) ? x * pts.width / (double)w : pts.width / 2;
+            double py = (h > 0) ? y * pts.height / (double)h : pts.height / 2;
+            if (vs != 0) {
+                double d = (vs > 0 ? -1.0 : 1.0) * 220.0;   /* 向下滚 → 内容上移 */
+                AXAgentSwipe(px, py, px, py + d, 0.25);
+            } else if (hs != 0) {
+                double d = (hs > 0 ? -1.0 : 1.0) * 220.0;
+                AXAgentSwipe(px, py, px + d, py, 0.25);
+            }
+        } else if (t == 0x04) {                /* backOrScreenOn 2B */
+            uint8_t b[1];
+            if (!AXReadDec(fd, b, 1)) { alive = NO; break; }
+            AXAgentPressHome();
+        } else if (t == 0x09) {                /* 剪贴板 14+n */
+            uint8_t b[13];
+            if (!AXReadDec(fd, b, 13)) { alive = NO; break; }
+            BOOL paste = (b[8] != 0);
+            uint32_t n = AXBE32(b + 9);
+            if (n > (16u << 20)) { alive = NO; break; }
+            uint8_t *tb = (uint8_t *)malloc(n ? n : 1);
+            if (!tb) { alive = NO; break; }
+            if (n && !AXReadDec(fd, tb, n)) { free(tb); alive = NO; break; }
+            NSString *str = n ? [[NSString alloc] initWithBytes:tb length:n encoding:NSUTF8StringEncoding] : @"";
+            free(tb);
+            if (paste) AXAgentPaste(str ?: @"");
+            else if (str) AXAgentPasteboardSet(str);
+        } else if (t == 0x11) {                /* 重置视频：无 payload（scrcpy 原义） */
+            g_force_key = 1;
+            ALog(@"🎚 PC 要求重置视频 → 下一帧强制 IDR");
+        } else if (t == 0x40) {                /* 13B：fps(4) bitrate(4) maxSide(4)，0=保持 */
+            uint8_t b[12];
+            if (!AXReadDec(fd, b, 12)) { alive = NO; break; }
+            AXApplyVideoParams(AXBE32(b), AXBE32(b + 4), AXBE32(b + 8));
+        } else if (t == 0x49) {                /* 上传：4B BE 长度前缀 + payload */
+            uint8_t lb[4];
+            if (!AXReadDec(fd, lb, 4)) { alive = NO; break; }
+            uint32_t n = AXBE32(lb);
+            if (n > (8u << 20)) { ALog(@"⚠️ 上传包过大 %u，断开", n); alive = NO; break; }
+            if (n && !AXSkipBytes(fd, n)) { alive = NO; break; }
+            ALog(@"📁 收到上传包 %u 字节（AXTouch 暂不支持写文件，已跳过）", n);
+        } else if (t == 0x10 || t == 0x42 || t == 0x43 || t == 0x44 ||
+                   t == 0x45 || t == 0x46 || t == 0x47 || t == 0x48) {
+            /* 这一族都是 [type][1B L][L 字节 payload]。必须按 L 吃掉，否则后面全错位
+               （PC 连上就会发 0x44 登录，错位会让控制通道立刻失效）。 */
+            uint8_t lb[1];
+            if (!AXReadDec(fd, lb, 1)) { alive = NO; break; }
+            uint32_t n = lb[0];
+            if (n && !AXSkipBytes(fd, n)) { alive = NO; break; }
+            ALog(@"📨 控制消息 0x%02X（L=%u）AXTouch 未实现，已跳过", t, n);
+        } else {
+            ALog(@"⚠️ 未知控制消息 0x%02X → 断开（后续字节已无法对齐）", t);
+            alive = NO;
+        }
+    }
+
+    ALog(@"🎛 控制通道断开");
+    close(fd);
+}
+
+static volatile int g_ctrlClientFd = -1;   /* 当前在服务的控制连接 */
+
+static void *AXCtrlConnThread(void *arg) {
+    int fd = (int)(intptr_t)arg;
+    AXCtrlHandleClient(fd);                 /* 内部负责 close(fd) */
+    if (g_ctrlClientFd == fd) g_ctrlClientFd = -1;
+    return NULL;
+}
+
+static void *AXCtrlAcceptLoop(void *arg) {
+    (void)arg;
+    while (g_ctrlRun) {
+        struct sockaddr_in ca;
+        socklen_t cl = sizeof(ca);
+        int fd = accept(g_ctrlListen, (struct sockaddr *)&ca, &cl);
+        if (fd < 0) {
+            if (!g_ctrlRun) break;
+            usleep(50 * 1000);
+            continue;
+        }
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        struct timeval tv = {0, 300 * 1000};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        /* ★ 新连接顶掉旧连接：PC 每次重连视频（重启服务/切档位/断线）都会新开控制连接。
+           以前这里是同步处理，旧连接只要还开着，新连接就永远卡在 TCP backlog 里进不来 ——
+           表现就是"PC 上显示已连接、点了完全没反应"。 */
+        int oldFd = g_ctrlClientFd;
+        if (oldFd >= 0 && oldFd != fd) {
+            ALog(@"🎛 新连接顶掉旧连接 fd=%d → %d", oldFd, fd);
+            shutdown(oldFd, SHUT_RDWR);
+        }
+        g_ctrlClientFd = fd;
+        pthread_t tid;
+        pthread_create(&tid, NULL, AXCtrlConnThread, (void *)(intptr_t)fd);
+        pthread_detach(tid);
+    }
+    return NULL;
+}
+
+static BOOL AXCtrlStart(uint16_t port) {
+    if (g_ctrlRun) return YES;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { ALog(@"❌ 控制端口 socket 失败"); return NO; }
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) != 0) {
+        ALog(@"❌ 控制端口 %u bind 失败 errno=%d", port, errno);
+        close(fd);
+        return NO;
+    }
+    if (listen(fd, 4) != 0) {
+        ALog(@"❌ 控制端口 listen 失败 errno=%d", errno);
+        close(fd);
+        return NO;
+    }
+    g_ctrlListen = fd;
+    g_ctrlRun = 1;
+    pthread_t tid;
+    pthread_create(&tid, NULL, AXCtrlAcceptLoop, NULL);
+    pthread_detach(tid);
+    ALog(@"✅ 控制通道已在 0.0.0.0:%u 监听", port);
+    return YES;
+}
+
+static void AXCtrlStop(void) {
+    if (!g_ctrlRun) return;
+    g_ctrlRun = 0;
+    if (g_ctrlListen >= 0) { close(g_ctrlListen); g_ctrlListen = -1; }
+    ALog(@"🛑 控制通道已停止");
+}
+
+BOOL AXStreamStart(uint16_t port) {
+    if (g_running) return YES;
+    AXLoadStoredUDIDIfNeeded();   /* ★ 用上次保存的真 UDID，别再用假 ID */
+
+    g_listenFd = socket(AF_INET, SOCK_STREAM, 0);
+    if (g_listenFd < 0) {
+        AXSetErr(errno, @"socket() 失败");
+        ALogShim(@"❌ socket() 失败 errno=%d", errno);
+        return NO;
+    }
+    int one = 1;
+    setsockopt(g_listenFd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(port);
+
+    if (bind(g_listenFd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        AXSetErr(errno, [NSString stringWithFormat:@"bind(%d) 失败 errno=%d", port, errno]);
+        ALogShim(@"❌ bind %d 失败 errno=%d（端口被占？）", port, errno);
+        close(g_listenFd);
+        g_listenFd = -1;
+        return NO;
+    }
+    if (listen(g_listenFd, 4) != 0) {
+        AXSetErr(errno, @"listen 失败");
+        close(g_listenFd);
+        g_listenFd = -1;
+        return NO;
+    }
+
+    /* ★ 关键：PC 端断开后继续 send() 会触发 SIGPIPE，iOS 默认直接杀进程。
+       「电脑一打开手机就闪退」的根因就是它 —— 忽略掉，send 返回 EPIPE 走正常断开分支 */
+    signal(SIGPIPE, SIG_IGN);
+
+    g_running = YES;
+    g_ptsMs = 0;
+    g_preambleSent = 0;
+    g_sentFrames = 0;
+    g_encW = g_encH = 0;
+
+    AXInstallLifecycleLog();
+    AXStartKeepAlive();   /* 后台保活（音频/定位/蓝牙） */
+    AXCtrlStart(27185);   /* 控制通道：PC 的点击/滑动/缩放/键盘/粘贴走这里 */
+    g_scheme = g_profileCapture;        /* 采集方式由档位决定，起流时生效 */
+    g_rkFallback = 0;
+    pthread_create(&g_acceptTid, NULL, AXAcceptLoop, NULL);
+    if (g_scheme == 1) {
+        ALogShim(@"🎥 采集方案：ReplayKit");
+        AXReplayKitStart();      /* 失败会自动把 g_scheme 置 0（回退 XCUITest） */
+    } else {
+        ALogShim(@"🎥 采集方案：XCUITest 截图");
+    }
+    pthread_create(&g_encTid, NULL, AXEncodeLoop, NULL);
+    ALogShim(@"✅ 推流服务已在 0.0.0.0:%d 监听", port);
+    return YES;
+}
+
+void AXStreamStop(void) {
+    if (!g_running) return;
+    g_running = NO;
+    AXCtrlStop();
+    AXReplayKitStopInternal();   /* 采集中就停掉，避免红条常驻 */
+    AXStopKeepAlive();
+
+    if (g_listenFd >= 0) { close(g_listenFd); g_listenFd = -1; }
+
+    pthread_mutex_lock(&g_clientMu);
+    for (int i = 0; i < 4; i++) {
+        if (g_clients[i] >= 0) { close(g_clients[i]); g_clients[i] = -1; }
+    }
+    g_clientCount = 0;
+    pthread_mutex_unlock(&g_clientMu);
+
+    if (g_vt) {
+        VTCompressionSessionCompleteFrames(g_vt, kCMTimeInvalid);
+        VTCompressionSessionInvalidate(g_vt);
+        CFRelease(g_vt);
+        g_vt = NULL;
+    }
+    g_encW = g_encH = 0;
+    /* 释放像素缓冲池（下次 Start 会按新尺寸重建） */
+    if (g_pbPool) {
+        CVPixelBufferPoolFlush(g_pbPool, kCVPixelBufferPoolFlushExcessBuffers);
+        CFRelease(g_pbPool);
+        g_pbPool = NULL;
+    }
+    g_pbPoolW = g_pbPoolH = 0;
+    g_preambleSent = 0;
+    ALogShim(@"🛑 推流服务已停止");
+}
+
+BOOL AXStreamIsRunning(void) { return g_running; }
+
+/* ★ 设置真 UDID：普通 App 拿不到，由 PC 端经 10010 传进来。
+   preamble 里必须发真 UDID，否则 PC 端把流当成一台独立的"新设备"，
+   既关联不到 usbmux 里的真机，还会多出一台重复设备。 */
+/* ===== 设备 UDID 持久化（用户手填 / PC 下发都走这里）=====
+   为什么存 Keychain：普通 App 拿不到真 UDID（lockdown 在沙盒里 EPERM、MobileGestalt 全 NULL、
+   XCTest 的 uniqueIdentifier 是会话级的每次启动都变），所以只能由人来提供一次。
+   Keychain 在卸载重装后仍然存在，Sideloadly 7 天重签也不用重新输入。 */
+static NSString *const kAXUDIDKey = @"axtouch.device.udid";
+static volatile int g_udidUserSet = 0;   /* 置位后人手填的值优先，不再被 devinfo 覆盖 */
+
+static NSString *AXStoredUDID(void) {
+    NSString *v = nil;
+    NSDictionary *q = @{ (__bridge id)kSecClass:       (__bridge id)kSecClassGenericPassword,
+                         (__bridge id)kSecAttrService: @"axtouch",
+                         (__bridge id)kSecAttrAccount: kAXUDIDKey,
+                         (__bridge id)kSecReturnData:  @YES,
+                         (__bridge id)kSecMatchLimit:  (__bridge id)kSecMatchLimitOne };
+    CFTypeRef out = NULL;
+    if (SecItemCopyMatching((__bridge CFDictionaryRef)q, &out) == errSecSuccess && out) {
+        NSData *d = (__bridge_transfer NSData *)out;
+        if (d.length) v = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+    }
+    if (v.length == 0) v = [[NSUserDefaults standardUserDefaults] stringForKey:kAXUDIDKey];
+    return v.length ? v : nil;
+}
+
+static void AXStoreUDID(NSString *v) {
+    NSDictionary *base = @{ (__bridge id)kSecClass:       (__bridge id)kSecClassGenericPassword,
+                            (__bridge id)kSecAttrService: @"axtouch",
+                            (__bridge id)kSecAttrAccount: kAXUDIDKey };
+    SecItemDelete((__bridge CFDictionaryRef)base);
+    NSMutableDictionary *add = [base mutableCopy];
+    add[(__bridge id)kSecValueData]      = [v dataUsingEncoding:NSUTF8StringEncoding];
+    add[(__bridge id)kSecAttrAccessible] = (__bridge id)kSecAttrAccessibleAfterFirstUnlock;
+    OSStatus st = SecItemAdd((__bridge CFDictionaryRef)add, NULL);
+    [[NSUserDefaults standardUserDefaults] setObject:v forKey:kAXUDIDKey];
+    ALogShim(@"💾 UDID 已存储 (keychain=%d)", (int)st);
+}
+
+/* 内部：真正写进 g_udid */
+static void AXApplyUDID(NSString *udid) {
+    if (udid.length == 0 || udid.length >= sizeof(g_udid)) return;
+    memset(g_udid, 0, sizeof(g_udid));
+    memcpy(g_udid, udid.UTF8String, udid.length);
+}
+
+/* 给 devinfo / 10010 用：人手填过就不覆盖（人手填的才是权威） */
+void AXStreamSetUDID(NSString *udid) {
+    if (g_udidUserSet) {
+        ALogShim(@"📺 UDID 已由用户指定，忽略自动探测值 %@", udid);
+        return;
+    }
+    AXApplyUDID(udid);
+    ALogShim(@"📺 已设置设备 UDID = %s（自动来源）", g_udid);
+}
+
+/* 用户手填 / PC 下发：写入并持久化，此后一律用它 */
+void AXStreamSetUDIDPersist(NSString *udid) {
+    NSString *t = [udid stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (t.length == 0) return;
+    AXApplyUDID(t);
+    AXStoreUDID(t);
+    g_udidUserSet = 1;
+    ALogShim(@"📺 已设置设备 UDID = %s（用户指定，已持久化）", g_udid);
+}
+
+/* 当前生效的 UDID（界面显示用）*/
+NSString *AXStreamCurrentUDID(void) {
+    return g_udid[0] ? @(g_udid) : @"";
+}
+
+/* 启动时载入上次存的（没有就用 identifierForVendor 兜底）*/
+static void AXLoadStoredUDIDIfNeeded(void) {
+    if (g_udid[0]) return;
+    NSString *v = AXStoredUDID();
+    if (v.length) {
+        AXApplyUDID(v);
+        g_udidUserSet = 1;
+        ALogShim(@"📺 已载入上次保存的设备 UDID = %s", g_udid);
+    }
+}
+
+void AXStreamSetPauseMs(int ms) {
+    g_capPauseMs = (ms < 0) ? 0 : (ms > 1000 ? 1000 : ms);
+    ALogShim(@"⏸ 手势后停采 = %dms", g_capPauseMs);
+}
+
+void AXStreamSetStaticDrop(int on) {
+    g_staticDrop = (on == 1) ? 1 : 0;
+    ALogShim(@"❄️ 静止自动降帧 = %@（下限 %dfps）", g_staticDrop ? @"开" : @"关", g_staticFps);
+}
+
+void AXStreamSetStaticFps(int fps) {
+    if (fps < 1) fps = 1;
+    if (fps > 60) fps = 60;
+    g_staticFps = fps;
+    ALogShim(@"❄️ 静止下限帧率 = %dfps", g_staticFps);
+}
+
+/* 发热定位：分段跑（0=正常 1=只截图 2=到缩放为止 3=只编码发送 4=空转） */
+void AXStreamSetBenchMode(int m) {
+    if (m < 0) m = 0;
+    if (m > 4) m = 4;
+    g_benchMode = m;
+    static const char *names[] = {
+        "正常全链路", "只截图（不解码不编码不发送）",
+        "截图+解码+缩放（不编码不发送）", "只编码发送（不截图）", "空转（只心跳）"
+    };
+    ALogShim(@"🧪 bench = %d（%s）", m, names[m]);
+}
+
+void AXStreamSetDecodeMode(int thumb) {
+    if (thumb < 0) thumb = 0;
+    if (thumb > 2) thumb = 2;
+    g_decodeThumb = thumb;
+    const char *nm = "全解+CGContext";
+    if (thumb == 1) nm = "ImageIO thumbnail";
+    else if (thumb == 2) nm = "GPU(CoreImage)";
+    ALogShim(@"🧩 解码路径 = %s", nm);
+}
+
+/* ★ 运行时调「事件确认间隔」（2026-11-02）。默认 5.0 秒：
+   daemon 合成一笔事件后要等确认，等不到就按这个上限超时（日志里
+   "No confirmation received for event, treating as non-fatal and continuing"）。
+   间隔太大 ⇒ 连续点击被逐笔排队 ⇒ 表现为「点一下要等、连点第二下没反应」。
+   ★ 设 0 会闪退（b78 实测，一点击就整个进程没了），所以只接受正值，最小 0.05。
+   给 10010 的 {"cmd":"cfmto","v":秒} 用，方便不重新出包就能试不同值。 */
+void AXSetEventConfirmInterval(double sec) {
+    if (!gSession) { ALog(@"❌ cfmto：会话未就绪"); return; }
+    if (sec < 0.05) sec = 0.05;      /* 0 = 闪退，永远不给 */
+    if (sec > 10.0) sec = 10.0;
+    SEL s = NSSelectorFromString(@"setImplicitEventConfirmationIntervalForCurrentContextWithoutSideEffects:");
+    if (![gSession respondsToSelector:s]) {
+        ALog(@"❌ cfmto：当前会话没有 WithoutSideEffects 版 setter");
+        return;
+    }
+    @try {
+        ((void (*)(id, SEL, double))objc_msgSend)(gSession, s, sec);
+        double now = -1;
+        SEL rd = NSSelectorFromString(@"implicitEventConfirmationIntervalForCurrentContext");
+        if ([gSession respondsToSelector:rd]) {
+            now = ((double (*)(id, SEL))objc_msgSend)(gSession, rd);
+        }
+        ALog(@"⚙️ cfmto 设为 %.3f，回读 = %.3f", sec, now);
+    } @catch (NSException *e) {
+        ALog(@"❌ cfmto 异常：%@", e.reason);
+    }
+}
+
+void AXStreamSetImgFormat(NSString *uti) {
+    if (uti.length == 0 || uti.length >= sizeof(g_imgUTI)) return;
+    memset(g_imgUTI, 0, sizeof(g_imgUTI));
+    memcpy(g_imgUTI, uti.UTF8String, uti.length);
+    ALogShim(@"🖼 截图格式改为 %s（下次采集生效）", g_imgUTI);
+}
+
+void AXStreamSetImgQuality(double q) {
+    if (q <= 0) q = 1.0;
+    if (q > 1.0) q = 1.0;
+    g_imgQuality = q;
+    ALogShim(@"🖼 截图质量参数 imgQuality=%.2f（下次采集生效）", q);
+}
+
+void AXStreamSetParams(int bitrateBps, int fps, int maxSide) {
+    /* 统一走 AXApplyVideoParams：码率/帧率能直接在现有会话上生效，
+       只有分辨率变化才需要重建编码会话（不再什么都不问就丢会话）。 */
+    AXApplyVideoParams((uint32_t)(fps > 0 ? fps : 0),
+                       (uint32_t)(bitrateBps > 0 ? bitrateBps : 0),
+                       (uint32_t)(maxSide > 0 ? maxSide : 0));
+}
+
+NSDictionary *AXStreamStats(void) {
+    return @{
+        @"running": @(g_running),
+        @"clients": @(g_clientCount),
+        @"sent": @(g_sentFrames),
+        @"fps": @(g_fps),
+        @"kbps": @(g_bitrate / 1000),
+        @"maxSide": @(g_maxSide),
+        @"w": @(g_encW),
+        @"h": @(g_encH),
+        @"bitrate": @(g_bitrate),
+        @"err": @(g_lastErr),
+        @"errMsg": g_lastErrMsg ?: @"",
+    };
+}
+
+
+/* ================= 远控2 状态与电脑连接管理接口 ================= */
+void AXMarkPCActive(const char *ip) {
+    g_lastPCActiveMs = AXNowMs();
+    if (ip && ip[0] != 0 && strcmp(ip, "127.0.0.1") != 0 && strcmp(ip, "0.0.0.0") != 0) {
+        snprintf(g_connectedPCIP, sizeof(g_connectedPCIP), "%s", ip);
+    }
+}
+
+BOOL AXIsPCConnected(void) {
+    if (g_clientCount > 0 || g_ctrlClientFd >= 0) return YES;
+    long long now = AXNowMs();
+    if (g_lastPCActiveMs > 0 && (now - g_lastPCActiveMs) < 25000) return YES;
+    return NO;
+}
+
+NSString *AXGetConnectedPCIP(void) {
+    return @(g_connectedPCIP);
+}
+
+int AXStreamClientCount(void) {
+    return g_clientCount;
+}
+
+int AXStreamSentFrames(void) {
+    return g_sentFrames;
+}
+
+void AXSetKeepAliveEnabled(BOOL enabled) {
+    g_keepAliveUserEnabled = enabled;
+    if (enabled) {
+        AXStartKeepAlive();
+    } else {
+        AXStopKeepAlive();
+    }
+}
+
+BOOL AXIsKeepAliveEnabled(void) {
+    return g_keepAliveUserEnabled;
+}
+
+void AXTriggerConnectPC(void) {
+    g_profileCapture = 1;
+    g_scheme = 1;
+    if (!g_running) {
+        AXStreamStart(27184);
+    } else {
+        g_force_key = 1;
+        if (![RPScreenRecorder sharedRecorder].isRecording) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                AXReplayKitStart();
+            });
+        }
+    }
+    /* 主动向电脑端控制台 (192.168.1.34:18765) 发起握手探测 */
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSString *pcip = @(g_connectedPCIP);
+        if (pcip.length == 0) pcip = @"192.168.1.34";
+        NSURL *u = [NSURL URLWithString:[NSString stringWithFormat:@"http://%@:18765/api/status", pcip]];
+        if (!u) return;
+        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:u
+                                                           cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                                       timeoutInterval:3.0];
+        NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req
+            completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+                if (!err && resp) {
+                    AXMarkPCActive(pcip.UTF8String);
+                    ALogShim(@"🤝 已主动连接电脑端控制台 (%@:18765)", pcip);
+                }
+            }];
+        [task resume];
+    });
+}

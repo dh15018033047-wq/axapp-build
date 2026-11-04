@@ -1,0 +1,58 @@
+name: AXTouch
+options:
+  bundleIdPrefix: com.mika.remote2
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+
+targets:
+  AXTouch:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources/AXTouch
+        excludes:
+          - "Frameworks/**"
+    dependencies:
+      - sdk: VideoToolbox.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreVideo.framework
+      - sdk: ImageIO.framework
+      - sdk: CoreImage.framework
+      - sdk: Metal.framework
+      - sdk: Security.framework
+      - sdk: ReplayKit.framework
+      - sdk: AVFoundation.framework
+      - sdk: AVKit.framework
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: 远控2
+        CFBundleName: 远控2
+        CFBundleShortVersionString: "3.0"
+        CFBundleVersion: "200"
+        UIBackgroundModes:
+          - audio
+          - fetch
+          - remote-notification
+          - voip
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSLocalNetworkUsageDescription: 远控2需要局域网权限以连接电脑进行屏幕投屏与AI控制
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.mika.remote2
+        PRODUCT_NAME: AXTouch
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
+        ENABLE_BITCODE: NO
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_VERSION: "5.0"
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/AXTouch/Bridging-Header.h
+        ARCHS: arm64
+        ONLY_ACTIVE_ARCH: NO
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"
